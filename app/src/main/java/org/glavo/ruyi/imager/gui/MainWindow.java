@@ -7,8 +7,13 @@ import javafx.animation.Animation;
 import javafx.animation.KeyFrame;
 import javafx.animation.Timeline;
 import javafx.application.Platform;
+import javafx.beans.Observable;
 import javafx.beans.binding.Bindings;
+import javafx.beans.binding.BooleanBinding;
+import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.ReadOnlyBooleanWrapper;
+import javafx.beans.property.SimpleBooleanProperty;
+import javafx.beans.value.ObservableBooleanValue;
 import javafx.collections.FXCollections;
 import javafx.collections.transformation.FilteredList;
 import javafx.concurrent.Task;
@@ -40,6 +45,7 @@ import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.stage.FileChooser;
 import javafx.stage.Modality;
@@ -166,6 +172,9 @@ public final class MainWindow {
 
     /// Compact bottom inset between modal selection lists and dialog actions.
     private static final double SELECTION_CONTENT_BOTTOM_INSET = 14.0;
+
+    /// Height reserved for the hint shown while a selection dialog has no confirmable selection.
+    private static final double SELECTION_HINT_HEIGHT = 18.0;
 
     /// Large logo resource shown beside the main title.
     private static final String HEADER_LOGO_RESOURCE = "/ruyi-logo-128.png";
@@ -361,6 +370,7 @@ public final class MainWindow {
                 "gui.dialog.ok",
                 "material-warning-dialog",
                 false,
+                null,
                 null);
         if (!confirmed) {
             return;
@@ -857,13 +867,18 @@ public final class MainWindow {
 
     /// Wraps a selection list with a search field.
     ///
+    /// Filtering keeps the item the user chose when it is still visible and clears the selection
+    /// otherwise. The selection is captured before the predicate changes, because the selection
+    /// model adjusts to the rebuilt item list synchronously and would otherwise report the item
+    /// that happened to land on the selected index.
+    ///
     /// @param header header text.
     /// @param listView selection list view.
     /// @param items source items.
     /// @param matcher item matcher receiving a normalized query.
     /// @param <T> item type.
     /// @return searchable selection content.
-    private static <T> Node searchableSelectionContent(
+    static <T> Node searchableSelectionContent(
             String header,
             ListView<T> listView,
             List<T> items,
@@ -874,23 +889,104 @@ public final class MainWindow {
         listView.setItems(filteredItems);
         searchField.textProperty().addListener((_, _, value) -> {
             String query = normalizeSearchQuery(value);
-            filteredItems.setPredicate(item -> query.isEmpty() || matcher.test(item, query));
             @Nullable T selected = listView.getSelectionModel().getSelectedItem();
-            if (filteredItems.isEmpty()) {
+            filteredItems.setPredicate(item -> query.isEmpty() || matcher.test(item, query));
+            // Filtering never selects an item on the user's behalf: it either restores the item the
+            // user chose or drops the selection, so the dialog cannot confirm a hidden item or one
+            // that the rebuild pushed onto the selected index.
+            if (selected != null && filteredItems.contains(selected)) {
+                listView.getSelectionModel().select(selected);
+            } else {
                 listView.getSelectionModel().clearSelection();
-            } else if (selected == null || !filteredItems.contains(selected)) {
-                listView.getSelectionModel().selectFirst();
             }
         });
 
-        VBox content = new VBox(10, selectionHeaderRow(header, searchField), listView);
+        BooleanBinding listEmpty = Bindings.isEmpty(filteredItems);
+        StackPane listArea = selectionEmptyState(listView, listEmpty);
+        Label selectHint = selectionRequiredHint(selectionCanConfirm(listView).not(), listEmpty);
+        VBox content = new VBox(10, selectionHeaderRow(header, searchField), listArea, selectHint);
         content.setMinWidth(SELECTION_LIST_WIDTH);
         content.setPrefWidth(SELECTION_LIST_WIDTH);
         content.setMaxWidth(SELECTION_LIST_WIDTH);
         content.setPadding(new Insets(0.0, 0.0, SELECTION_CONTENT_BOTTOM_INSET, 0.0));
         content.getStyleClass().add("selection-content");
-        VBox.setVgrow(listView, Priority.NEVER);
+        VBox.setVgrow(listArea, Priority.NEVER);
         return content;
+    }
+
+    /// Returns whether the current selection of a list or tree view can be confirmed.
+    ///
+    /// A tree category only groups images, so selecting one does not make the dialog confirmable.
+    ///
+    /// @param selectionView selection list or tree view.
+    /// @return binding that is true while a confirmable item is selected.
+    static BooleanBinding selectionCanConfirm(Control selectionView) {
+        if (selectionView instanceof ListView<?> listView) {
+            return listView.getSelectionModel().selectedItemProperty().isNull().not();
+        }
+        if (selectionView instanceof TreeView<?> treeView) {
+            return Bindings.createBooleanBinding(
+                    () -> selectedTreeImageOf(treeView) != null,
+                    treeView.getSelectionModel().selectedItemProperty());
+        }
+        throw new IllegalArgumentException("Unsupported selection view: " + selectionView.getClass().getName());
+    }
+
+    /// Returns the selected image of a tree view without exposing its node type.
+    ///
+    /// @param treeView operating system tree view.
+    /// @return selected image, or null when the selection is empty or not an image.
+    @SuppressWarnings("unchecked")
+    private static @Nullable ImageEntry selectedTreeImageOf(TreeView<?> treeView) {
+        return selectedTreeImage((TreeView<OperatingSystemTreeNode>) treeView);
+    }
+
+    /// Creates the hint shown while a selection dialog has items but no confirmable selection.
+    ///
+    /// @param noSelection whether nothing confirmable is selected.
+    /// @param noItems whether the filtered view has no items at all.
+    /// @return hint label.
+    private static Label selectionRequiredHint(ObservableBooleanValue noSelection, ObservableBooleanValue noItems) {
+        Label hint = new Label();
+        hint.textProperty().bind(Messages.binding("gui.search.selectRequired"));
+        hint.getStyleClass().add("selection-required-hint");
+        hint.setMinHeight(SELECTION_HINT_HEIGHT);
+        hint.setPrefHeight(SELECTION_HINT_HEIGHT);
+        hint.setMaxHeight(SELECTION_HINT_HEIGHT);
+        hint.visibleProperty().bind(Bindings.createBooleanBinding(
+                () -> noSelection.get() && !noItems.get(),
+                noSelection,
+                noItems));
+        return hint;
+    }
+
+    /// Wraps a selection control with a hint shown while it has no items.
+    ///
+    /// The MaterialFX legacy list and tree skins ignore the `placeholder` property inherited from
+    /// `ListView` and `TreeView`, so the hint is stacked on top of the view instead.
+    ///
+    /// @param selectionView selection list or tree view.
+    /// @param empty whether the view currently has no items.
+    /// @return container holding the selection view and the empty-state hint.
+    private static StackPane selectionEmptyState(Control selectionView, ObservableBooleanValue empty) {
+        Label title = new Label();
+        title.textProperty().bind(Messages.binding("gui.search.noMatch"));
+        title.getStyleClass().add("selection-empty-title");
+
+        Label hint = new Label();
+        hint.textProperty().bind(Messages.binding("gui.search.noMatchHint"));
+        hint.getStyleClass().add("selection-empty-hint");
+
+        VBox message = new VBox(6.0, title, hint);
+        message.setAlignment(Pos.CENTER);
+        message.setMouseTransparent(true);
+        message.visibleProperty().bind(empty);
+
+        StackPane area = new StackPane(selectionView, message);
+        area.setMinSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
+        area.setPrefSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
+        area.setMaxSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
+        return area;
     }
 
     /// Creates the search field used by selection dialogs.
@@ -944,26 +1040,28 @@ public final class MainWindow {
             @Nullable ImageEntry currentImage) {
         TextField searchField = selectionSearchField();
 
+        BooleanProperty treeEmpty = new SimpleBooleanProperty();
         Runnable refreshTree = () -> {
             String query = normalizeSearchQuery(searchField.getText());
-            @Nullable ImageEntry selected = selectedTreeImage(treeView);
-            populateOperatingSystemTree(
-                    treeView,
-                    images,
-                    query,
-                    selected == null ? currentImage : selected);
+            // Only the initial population restores the current image. Later refreshes keep whatever
+            // the user selected, so filtering never brings back an image the filter hid.
+            populateOperatingSystemTree(treeView, images, query, selectedTreeImage(treeView));
+            treeEmpty.set(treeView.getRoot() == null || treeView.getRoot().getChildren().isEmpty());
         };
 
         searchField.textProperty().addListener((_, _, _) -> refreshTree.run());
         populateOperatingSystemTree(treeView, images, "", currentImage);
+        treeEmpty.set(treeView.getRoot() == null || treeView.getRoot().getChildren().isEmpty());
 
-        VBox content = new VBox(10, selectionHeaderRow(header, searchField), treeView);
+        StackPane treeArea = selectionEmptyState(treeView, treeEmpty);
+        Label selectHint = selectionRequiredHint(selectionCanConfirm(treeView).not(), treeEmpty);
+        VBox content = new VBox(10, selectionHeaderRow(header, searchField), treeArea, selectHint);
         content.setMinWidth(SELECTION_LIST_WIDTH);
         content.setPrefWidth(SELECTION_LIST_WIDTH);
         content.setMaxWidth(SELECTION_LIST_WIDTH);
         content.setPadding(new Insets(0.0, 0.0, SELECTION_CONTENT_BOTTOM_INSET, 0.0));
         content.getStyleClass().add("selection-content");
-        VBox.setVgrow(treeView, Priority.NEVER);
+        VBox.setVgrow(treeArea, Priority.NEVER);
         return content;
     }
 
@@ -1013,9 +1111,8 @@ public final class MainWindow {
         }
 
         treeView.setRoot(root);
-        if (selectedItem == null) {
-            selectedItem = firstImageTreeItem(root);
-        }
+        // The tree never selects an image on the user's behalf; only a previously chosen image is
+        // restored, so an explicit click is required before the dialog can be confirmed.
         if (selectedItem == null) {
             treeView.getSelectionModel().clearSelection();
         } else {
@@ -1026,7 +1123,7 @@ public final class MainWindow {
     /// Returns the selected image from an operating system tree.
     ///
     /// @param treeView operating system tree view.
-    /// @return selected image, first image under a selected category, or null when the tree is empty.
+    /// @return selected image, or null when nothing is selected or the selection is a category.
     static @Nullable ImageEntry selectedTreeImage(TreeView<OperatingSystemTreeNode> treeView) {
         @Nullable TreeItem<OperatingSystemTreeNode> selectedItem =
                 treeView.getSelectionModel().getSelectedItem();
@@ -1035,41 +1132,9 @@ public final class MainWindow {
         }
 
         @Nullable OperatingSystemTreeNode node = selectedItem.getValue();
-        if (node == null) {
-            return null;
-        }
-        @Nullable ImageEntry image = node.image();
-        if (image != null) {
-            return image;
-        }
-
-        @Nullable TreeItem<OperatingSystemTreeNode> firstChild = firstImageTreeItem(selectedItem);
-        if (firstChild == null) {
-            return null;
-        }
-        @Nullable OperatingSystemTreeNode firstChildNode = firstChild.getValue();
-        return firstChildNode == null ? null : firstChildNode.image();
+        return node == null ? null : node.image();
     }
 
-    /// Finds the first image leaf in an operating system tree.
-    ///
-    /// @param root root tree item or category tree item.
-    /// @return first image tree item, or null when the tree is empty.
-    private static @Nullable TreeItem<OperatingSystemTreeNode> firstImageTreeItem(
-            TreeItem<OperatingSystemTreeNode> root) {
-        @Nullable OperatingSystemTreeNode node = root.getValue();
-        if (node != null && node.image() != null) {
-            return root;
-        }
-
-        for (TreeItem<OperatingSystemTreeNode> child : root.getChildren()) {
-            @Nullable TreeItem<OperatingSystemTreeNode> imageItem = firstImageTreeItem(child);
-            if (imageItem != null) {
-                return imageItem;
-            }
-        }
-        return null;
-    }
 
     /// Normalizes search text for case-insensitive matching.
     ///
@@ -1126,6 +1191,7 @@ public final class MainWindow {
                     settings.root(),
                     "gui.settings.save",
                     "material-settings-dialog",
+                    null,
                     null);
         } finally {
             settings.root().disableProperty().unbind();
@@ -1441,7 +1507,7 @@ public final class MainWindow {
         });
         selectCurrentManufacturer(listView, state.manufacturerName());
 
-        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseManufacturer"), content, listView)) {
+        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseManufacturer"), content, listView, selectionCanConfirm(listView))) {
             ManufacturerOption selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
                 state = new WizardState(selected.name(), null, null, null, state.target());
@@ -1499,7 +1565,7 @@ public final class MainWindow {
         });
         selectCurrentBoard(listView, state.boardName());
 
-        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseBoard"), content, listView)) {
+        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseBoard"), content, listView, selectionCanConfirm(listView))) {
             BoardOption selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
                 state = new WizardState(state.manufacturerName(), selected.name(), null, null, state.target());
@@ -1575,7 +1641,7 @@ public final class MainWindow {
             }
         });
 
-        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseOperatingSystem"), content, treeView)) {
+        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseOperatingSystem"), content, treeView, selectionCanConfirm(treeView))) {
             @Nullable ImageEntry selected = selectedTreeImage(treeView);
             if (selected != null) {
                 selectCatalogImage(selected);
@@ -1690,7 +1756,7 @@ public final class MainWindow {
         });
         selectCurrentFastbootTarget(listView, state.target());
 
-        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseFastbootDevice"), content, listView)) {
+        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseFastbootDevice"), content, listView, selectionCanConfirm(listView))) {
             FastbootDevice selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
                 state = new WizardState(
@@ -1752,7 +1818,7 @@ public final class MainWindow {
         });
         selectCurrentBlockTarget(listView, state.target());
 
-        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseStorageDevice"), content, listView)) {
+        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseStorageDevice"), content, listView, selectionCanConfirm(listView))) {
             BlockDevice selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
                 state = new WizardState(
@@ -1843,7 +1909,8 @@ public final class MainWindow {
         if (showSelectionDialog(
                 Messages.get("gui.dialog.choosePartitionStorageDevice"),
                 Messages.get("gui.dialog.choosePartitionStorageDevice.header"),
-                content)) {
+                content,
+                partitionSelectorsReady(selectors))) {
             @Nullable FlashTarget selectedTarget = partitionTargetSelection(selectors);
             if (selectedTarget != null) {
                 state = new WizardState(
@@ -1855,6 +1922,22 @@ public final class MainWindow {
                 refreshState();
             }
         }
+    }
+
+    /// Returns whether every partition selector has a target.
+    ///
+    /// The partition dialog stays unconfirmable while a partition is unset, so accepting it always
+    /// produces a complete target map instead of closing on an incomplete one.
+    ///
+    /// @param selectors partition selectors.
+    /// @return binding that is true while every partition has a target.
+    static BooleanBinding partitionSelectorsReady(
+            @Unmodifiable Map<String, MFXComboBox<BlockDevice>> selectors) {
+        return Bindings.createBooleanBinding(
+                () -> selectors.values().stream().allMatch(selector -> selector.getValue() != null),
+                selectors.values().stream()
+                        .map(MFXComboBox::valueProperty)
+                        .toArray(Observable[]::new));
     }
 
     /// Builds a flash target from partition selector values.
@@ -1928,6 +2011,7 @@ public final class MainWindow {
                 confirmContent,
                 "gui.button.flash",
                 "material-confirm-dialog",
+                null,
                 null)) {
             return;
         }
@@ -2854,7 +2938,10 @@ public final class MainWindow {
         return Character.toUpperCase(lower.charAt(0)) + lower.substring(1);
     }
 
-    /// Selects the current manufacturer when the dialog opens.
+    /// Restores the current manufacturer when the dialog opens.
+    ///
+    /// The dialog never selects an item on the user's behalf: nothing is selected unless the user
+    /// previously chose a manufacturer and it is still offered.
     ///
     /// @param listView manufacturer list view.
     /// @param manufacturerName selected manufacturer name.
@@ -2862,7 +2949,6 @@ public final class MainWindow {
             ListView<ManufacturerOption> listView,
             @Nullable String manufacturerName) {
         if (manufacturerName == null) {
-            listView.getSelectionModel().selectFirst();
             return;
         }
 
@@ -2872,16 +2958,17 @@ public final class MainWindow {
                 return;
             }
         }
-        listView.getSelectionModel().selectFirst();
     }
 
-    /// Selects the current board when the dialog opens.
+    /// Restores the current board when the dialog opens.
+    ///
+    /// The dialog never selects an item on the user's behalf: nothing is selected unless the user
+    /// previously chose a board and it is still offered.
     ///
     /// @param listView board list view.
     /// @param boardName selected board name.
     private static void selectCurrentBoard(ListView<BoardOption> listView, @Nullable String boardName) {
         if (boardName == null) {
-            listView.getSelectionModel().selectFirst();
             return;
         }
 
@@ -2891,17 +2978,18 @@ public final class MainWindow {
                 return;
             }
         }
-        listView.getSelectionModel().selectFirst();
     }
 
-    /// Selects the current block target when the dialog opens.
+    /// Restores the current block target when the dialog opens.
+    ///
+    /// The dialog never selects a target on the user's behalf, because writing to a device is
+    /// destructive: nothing is selected unless the user previously chose that target.
     ///
     /// @param listView target list view.
     /// @param target selected target.
     private static void selectCurrentBlockTarget(ListView<BlockDevice> listView, @Nullable FlashTarget target) {
         @Nullable BlockDevice blockDevice = target == null ? null : target.blockDevice();
         if (blockDevice == null) {
-            listView.getSelectionModel().selectFirst();
             return;
         }
 
@@ -2911,17 +2999,18 @@ public final class MainWindow {
                 return;
             }
         }
-        listView.getSelectionModel().selectFirst();
     }
 
-    /// Selects the current fastboot target when the dialog opens.
+    /// Restores the current fastboot target when the dialog opens.
+    ///
+    /// The dialog never selects a target on the user's behalf, because writing to a device is
+    /// destructive: nothing is selected unless the user previously chose that target.
     ///
     /// @param listView target list view.
     /// @param target selected target.
     private static void selectCurrentFastbootTarget(ListView<FastbootDevice> listView, @Nullable FlashTarget target) {
         @Nullable FastbootDevice fastbootDevice = target == null ? null : target.fastbootDevice();
         if (fastbootDevice == null) {
-            listView.getSelectionModel().selectFirst();
             return;
         }
 
@@ -2931,7 +3020,6 @@ public final class MainWindow {
                 return;
             }
         }
-        listView.getSelectionModel().selectFirst();
     }
 
     /// Finds one block device by id in a device list.
@@ -3468,6 +3556,7 @@ public final class MainWindow {
                 "gui.dialog.ok",
                 styleClass,
                 false,
+                null,
                 null);
 
         if (Platform.isFxApplicationThread()) {
@@ -3482,15 +3571,22 @@ public final class MainWindow {
     /// @param title dialog title.
     /// @param header dialog header.
     /// @param content dialog content.
+    /// @param canConfirm whether the dialog can be confirmed, or null when the content has no
+    ///        selection to satisfy.
     /// @return whether the user accepted the dialog.
-    private boolean showSelectionDialog(String title, String header, Node content) {
+    private boolean showSelectionDialog(
+            String title,
+            String header,
+            Node content,
+            @Nullable ObservableBooleanValue canConfirm) {
         return showConfirmationDialog(
                 title,
                 header,
                 content,
                 "gui.dialog.select",
                 "material-selection-dialog",
-                null);
+                null,
+                canConfirm);
     }
 
     /// Shows a MaterialFX selection dialog whose header is rendered inside the content area.
@@ -3498,15 +3594,21 @@ public final class MainWindow {
     /// @param title dialog title.
     /// @param content dialog content.
     /// @param selectionView list or tree view whose items confirm the dialog on double-click.
+    /// @param canConfirm whether the dialog can be confirmed with the current selection.
     /// @return whether the user accepted the dialog.
-    private boolean showSearchableSelectionDialog(String title, Node content, Control selectionView) {
+    private boolean showSearchableSelectionDialog(
+            String title,
+            Node content,
+            Control selectionView,
+            @Nullable ObservableBooleanValue canConfirm) {
         return showConfirmationDialog(
                 title,
                 "",
                 content,
                 "gui.dialog.select",
                 "material-search-selection-dialog",
-                selectionView);
+                selectionView,
+                canConfirm);
     }
 
     /// Shows a MaterialFX confirmation dialog with custom content.
@@ -3518,6 +3620,8 @@ public final class MainWindow {
     /// @param styleClass dialog style class.
     /// @param doubleClickSelectionView list or tree view that confirms the dialog when an item is
     ///        double-clicked, or null to keep confirmation on the confirm button only.
+    /// @param canConfirm whether the dialog can be confirmed with the current selection, or null
+    ///        when the dialog has no selection to satisfy.
     /// @return whether the user accepted the dialog.
     private boolean showConfirmationDialog(
             String title,
@@ -3525,7 +3629,8 @@ public final class MainWindow {
             Node content,
             String confirmKey,
             String styleClass,
-            @Nullable Control doubleClickSelectionView) {
+            @Nullable Control doubleClickSelectionView,
+            @Nullable ObservableBooleanValue canConfirm) {
         return showMaterialDialog(
                 title,
                 header,
@@ -3533,7 +3638,8 @@ public final class MainWindow {
                 confirmKey,
                 styleClass,
                 true,
-                doubleClickSelectionView);
+                doubleClickSelectionView,
+                canConfirm);
     }
 
     /// Shows the available application update actions.
@@ -3614,6 +3720,8 @@ public final class MainWindow {
     /// @param showCancel whether to show a cancel action.
     /// @param doubleClickSelectionView list or tree view that confirms the dialog when an item is
     ///        double-clicked, or null to keep confirmation on the confirm button only.
+    /// @param canConfirm whether the dialog can be confirmed with the current selection, or null
+    ///        when the dialog has no selection to satisfy.
     /// @return whether the user accepted the dialog.
     private boolean showMaterialDialog(
             String title,
@@ -3622,7 +3730,8 @@ public final class MainWindow {
             String confirmKey,
             String styleClass,
             boolean showCancel,
-            @Nullable Control doubleClickSelectionView) {
+            @Nullable Control doubleClickSelectionView,
+            @Nullable ObservableBooleanValue canConfirm) {
         AtomicBoolean accepted = new AtomicBoolean();
         @Nullable MFXButton cancelButton = showCancel
                 ? dialogActionButton("gui.dialog.cancel", "dialog-secondary-button")
@@ -3664,14 +3773,19 @@ public final class MainWindow {
         if (cancelButton != null) {
             cancelButton.setOnAction(_ -> dialog.close());
         }
+        if (canConfirm != null) {
+            confirmButton.disableProperty().bind(Bindings.not(canConfirm));
+        }
         confirmButton.setOnAction(_ -> {
             accepted.set(true);
             dialog.close();
         });
         if (doubleClickSelectionView != null) {
             installDoubleClickAccept(doubleClickSelectionView, () -> {
-                accepted.set(true);
-                dialog.close();
+                if (canConfirm == null || canConfirm.get()) {
+                    accepted.set(true);
+                    dialog.close();
+                }
             });
         }
         installDialogKeyHandling(dialogContent, dialog::close, () -> {
