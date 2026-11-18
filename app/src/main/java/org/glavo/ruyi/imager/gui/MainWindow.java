@@ -7,6 +7,7 @@ import javafx.animation.Animation;
 import javafx.animation.KeyFrame;
 import javafx.animation.Timeline;
 import javafx.application.Platform;
+import javafx.beans.InvalidationListener;
 import javafx.beans.Observable;
 import javafx.beans.binding.Bindings;
 import javafx.beans.binding.BooleanBinding;
@@ -25,6 +26,7 @@ import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonBase;
 import javafx.scene.control.Cell;
+import javafx.scene.control.CheckBox;
 import javafx.scene.control.Control;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListView;
@@ -117,6 +119,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -930,14 +935,21 @@ public final class MainWindow {
             ListView<T> listView,
             List<T> items,
             BiPredicate<T, String> matcher) {
+        return searchableSelectionContent(header, listView, items, matcher, null);
+    }
+
+    /// Combines the text matcher with an optional catalog filter observed by the matcher.
+    private static <T> Node searchableSelectionContent(
+            String header, ListView<T> listView, List<T> items, BiPredicate<T, String> matcher,
+            @Nullable MFXComboBox<String> filter) {
         TextField searchField = selectionSearchField();
 
         FilteredList<T> filteredItems = new FilteredList<>(FXCollections.observableArrayList(items));
         listView.setItems(filteredItems);
-        searchField.textProperty().addListener((_, _, value) -> {
-            String query = normalizeSearchQuery(value);
+        Runnable refresh = () -> {
+            String query = normalizeSearchQuery(searchField.getText());
             @Nullable T selected = listView.getSelectionModel().getSelectedItem();
-            filteredItems.setPredicate(item -> query.isEmpty() || matcher.test(item, query));
+            filteredItems.setPredicate(item -> (query.isEmpty() && filter == null) || matcher.test(item, query));
             // Filtering never selects an item on the user's behalf: it either restores the item the
             // user chose or drops the selection, so the dialog cannot confirm a hidden item or one
             // that the rebuild pushed onto the selected index.
@@ -946,12 +958,19 @@ public final class MainWindow {
             } else {
                 listView.getSelectionModel().clearSelection();
             }
-        });
+        };
+        searchField.textProperty().addListener((_, _, _) -> refresh.run());
+        if (filter != null) {
+            filter.getSelectionModel().selection().addListener((Observable _) -> refresh.run());
+        }
 
         BooleanBinding listEmpty = Bindings.isEmpty(filteredItems);
         StackPane listArea = selectionEmptyState(listView, listEmpty);
         Label selectHint = selectionRequiredHint(selectionCanConfirm(listView).not(), listEmpty);
         VBox content = new VBox(10, selectionHeaderRow(header, searchField), listArea, selectHint);
+        if (filter != null) {
+            content.getChildren().add(1, filter);
+        }
         content.setMinWidth(SELECTION_LIST_WIDTH);
         content.setPrefWidth(SELECTION_LIST_WIDTH);
         content.setMaxWidth(SELECTION_LIST_WIDTH);
@@ -1073,7 +1092,42 @@ public final class MainWindow {
         return row;
     }
 
-    /// Wraps an operating system tree with search and a supplier filter.
+    /// Builds a filter showing localized supplier names while matching metadata identifiers.
+    private static MFXComboBox<String> supplierFilter(String id, Stream<String> suppliers) {
+        return catalogFilter(id, "gui.image.supplier", "gui.image.allSuppliers", suppliers, ManufacturerNames::displayName);
+    }
+
+    /// Builds a single-selection catalog filter with an unrestricted first option.
+    private static MFXComboBox<String> catalogFilter(String id, String labelKey, String allKey,
+            Stream<String> values, Function<String, String> displayName) {
+        MFXComboBox<String> filter = new MFXComboBox<>();
+        filter.setAllowEdit(false);
+        filter.getSelectionModel().setAllowsMultipleSelection(false);
+        filter.setId(id);
+        filter.setAccessibleText(Messages.get(labelKey));
+        filter.setPrefWidth(180);
+        filter.setMaxWidth(180);
+        filter.getItems().add("");
+        filter.getItems().addAll(values.filter(value -> !value.isBlank()).distinct().sorted().toList());
+        filter.setConverter(new StringConverter<>() {
+            /// Displays the filter label without changing its metadata value.
+            @Override
+            public String toString(@Nullable String value) {
+                return value == null || value.isEmpty() ? Messages.get(allKey) : displayName.apply(value);
+            }
+
+            /// Returns the unchanged value for this non-editable selector.
+            @Override
+            public String fromString(String value) {
+                return value;
+            }
+        });
+        filter.selectFirst();
+        filter.setText(Messages.get(allKey));
+        return filter;
+    }
+
+    /// Wraps an operating system tree with search, supplier, variant, and writer support filters.
     ///
     /// @param header header text.
     /// @param treeView operating system tree view.
@@ -1088,57 +1142,43 @@ public final class MainWindow {
             @Nullable ImageEntry currentImage,
             @Nullable String boardName) {
         TextField searchField = selectionSearchField();
-        MFXComboBox<String> supplierFilter = new MFXComboBox<>();
-        supplierFilter.setAllowEdit(false);
-        supplierFilter.getSelectionModel().setAllowsMultipleSelection(false);
-        supplierFilter.setId("image-supplier-filter");
-        supplierFilter.setAccessibleText(Messages.get("gui.image.supplier"));
-        supplierFilter.setPrefWidth(240);
-        supplierFilter.setMaxWidth(240);
-        supplierFilter.getItems().add("");
-        supplierFilter.getItems().addAll(images.stream()
-                .flatMap(image -> image.targets().stream())
-                .filter(target -> target.matches(null, boardName))
-                .map(ImageTarget::manufacturer)
-                .filter(name -> !name.isEmpty())
-                .distinct().sorted().toList());
-        supplierFilter.setConverter(new StringConverter<>() {
-            /// Displays the optional supplier filter without changing metadata identifiers.
-            @Override
-            public String toString(@Nullable String supplier) {
-                return supplier == null || supplier.isEmpty()
-                        ? Messages.get("gui.image.allSuppliers") : ManufacturerNames.displayName(supplier);
-            }
-
-            /// Returns the unchanged value for this non-editable selector.
-            @Override
-            public String fromString(String value) {
-                return value;
-            }
-        });
-        supplierFilter.selectFirst();
-        supplierFilter.setText(Messages.get("gui.image.allSuppliers"));
+        @Unmodifiable List<ImageTarget> targets = images.stream().flatMap(image -> image.targets().stream())
+                .filter(target -> target.matches(null, boardName)).distinct().toList();
+        MFXComboBox<String> supplierFilter = supplierFilter("image-supplier-filter", targets.stream().map(ImageTarget::manufacturer));
+        MFXComboBox<String> variantFilter = catalogFilter("image-variant-filter", "gui.image.variant",
+                "gui.image.allVariants", targets.stream().map(ImageTarget::variant), Function.identity());
+        CheckBox flashableOnly = new CheckBox(Messages.get("gui.image.flashableOnly"));
+        HBox filters = new HBox(10, supplierFilter, variantFilter, flashableOnly);
+        filters.setAlignment(Pos.CENTER_LEFT);
 
         BooleanProperty treeEmpty = new SimpleBooleanProperty();
-        Runnable refreshTree = () -> {
+        Consumer<@Nullable ImageEntry> refreshTree = selected -> {
             String query = normalizeSearchQuery(searchField.getText());
             @Nullable String supplier = supplierFilter.getSelectedItem();
-            @Unmodifiable List<ImageEntry> filtered = filteredImages(images,
-                    supplier == null || supplier.isEmpty() ? null : supplier, boardName);
+            @Nullable String variant = variantFilter.getSelectedItem();
+            Predicate<ImageTarget> matchesTarget = target ->
+                    target.matches(supplier == null || supplier.isEmpty() ? null : supplier, boardName)
+                            && (variant == null || variant.isEmpty() || variant.equals(target.variant()));
+            @Unmodifiable List<ImageEntry> filtered = images.stream()
+                    .filter(image -> !flashableOnly.isSelected() || catalogImageFlashable(image))
+                    .filter(image -> image.targets().stream().anyMatch(matchesTarget))
+                    .toList();
             // Only the initial population restores the current image. Later refreshes keep whatever
             // the user selected, so filtering never brings back an image the filter hid.
-            populateOperatingSystemTree(treeView, filtered, query, selectedTreeImage(treeView));
+            populateOperatingSystemTree(treeView, filtered, query, matchesTarget, selected);
             treeEmpty.set(treeView.getRoot() == null || treeView.getRoot().getChildren().isEmpty());
         };
 
-        searchField.textProperty().addListener((_, _, _) -> refreshTree.run());
-        supplierFilter.getSelectionModel().selection().addListener((Observable _) -> refreshTree.run());
-        populateOperatingSystemTree(treeView, filteredImages(images, null, boardName), "", currentImage);
-        treeEmpty.set(treeView.getRoot() == null || treeView.getRoot().getChildren().isEmpty());
+        InvalidationListener changed = _ -> refreshTree.accept(selectedTreeImage(treeView));
+        searchField.textProperty().addListener(changed);
+        supplierFilter.getSelectionModel().selection().addListener(changed);
+        variantFilter.getSelectionModel().selection().addListener(changed);
+        flashableOnly.selectedProperty().addListener(changed);
+        refreshTree.accept(currentImage);
 
         StackPane treeArea = selectionEmptyState(treeView, treeEmpty);
         Label selectHint = selectionRequiredHint(selectionCanConfirm(treeView).not(), treeEmpty);
-        VBox content = new VBox(10, selectionHeaderRow(header, searchField), supplierFilter, treeArea, selectHint);
+        VBox content = new VBox(10, selectionHeaderRow(header, searchField), filters, treeArea, selectHint);
         content.setMinWidth(SELECTION_LIST_WIDTH);
         content.setPrefWidth(SELECTION_LIST_WIDTH);
         content.setMaxWidth(SELECTION_LIST_WIDTH);
@@ -1153,11 +1193,13 @@ public final class MainWindow {
     /// @param treeView operating system tree view.
     /// @param images source image entries.
     /// @param query normalized search query.
+    /// @param matchesTarget limits target-specific search terms to the active filters.
     /// @param selectedImage image to select after rebuilding.
     private static void populateOperatingSystemTree(
             TreeView<OperatingSystemTreeNode> treeView,
             List<ImageEntry> images,
             String query,
+            Predicate<ImageTarget> matchesTarget,
             @Nullable ImageEntry selectedImage) {
         TreeItem<OperatingSystemTreeNode> root = new TreeItem<>(
                 new OperatingSystemTreeNode("", null, 0));
@@ -1171,7 +1213,7 @@ public final class MainWindow {
             ArrayList<ImageEntry> matchingImages = new ArrayList<>();
             for (ImageEntry image : images) {
                 if (operatingSystemCategoryId(image).equals(category.id())
-                        && (query.isEmpty() || categoryMatches || imageMatches(image, query))) {
+                        && (query.isEmpty() || categoryMatches || imageMatches(image, query, matchesTarget))) {
                     matchingImages.add(image);
                 }
             }
@@ -1573,7 +1615,7 @@ public final class MainWindow {
 
         ListView<BoardOption> listView = selectionListView();
         String header = Messages.get("gui.dialog.chooseBoard.header");
-        Node content = searchableSelectionContent(header, listView, boards, MainWindow::boardMatches);
+        Node content = boardSelectionContent(header, listView, boards);
         listView.setCellFactory(_ -> new MFXLegacyListCell<>() {
             /// Updates one board list cell.
             ///
@@ -1594,6 +1636,17 @@ public final class MainWindow {
                 selectBoard(selected.name());
             }
         }
+    }
+
+    /// Filters the complete board list without making a supplier a required selection.
+    private static Node boardSelectionContent(String header, ListView<BoardOption> list, List<BoardOption> boards) {
+        MFXComboBox<String> filter = supplierFilter("board-supplier-filter",
+                boards.stream().flatMap(board -> board.suppliers().stream()));
+        return searchableSelectionContent(header, list, boards, (board, query) -> {
+            @Nullable String supplier = filter.getSelectedItem();
+            return (supplier == null || supplier.isEmpty() || board.suppliers().contains(supplier))
+                    && (query.isEmpty() || boardMatches(board, query));
+        }, filter);
     }
 
     /// Selects a board across suppliers and clears the previous source and device.
@@ -3436,10 +3489,10 @@ public final class MainWindow {
     /// @param image image entry.
     /// @param query normalized query.
     /// @return whether the image matches.
-    private static boolean imageMatches(ImageEntry image, String query) {
+    private static boolean imageMatches(ImageEntry image, String query, Predicate<ImageTarget> matchesTarget) {
         return textMatches(image.displayName(), query)
                 || textMatches(operatingSystemCategoryName(image), query)
-                || image.targets().stream().anyMatch(target -> textMatches(target.manufacturer(), query)
+                || image.targets().stream().filter(matchesTarget).anyMatch(target -> textMatches(target.manufacturer(), query)
                         || textMatches(ManufacturerNames.displayName(target.manufacturer()), query)
                         || textMatches(target.board(), query)
                         || textMatches(target.variant(), query))

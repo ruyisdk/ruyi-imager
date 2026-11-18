@@ -15,6 +15,7 @@ import javafx.animation.Animation;
 import javafx.animation.Timeline;
 import javafx.application.Platform;
 import javafx.scene.control.Button;
+import javafx.scene.control.CheckBox;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.property.ReadOnlyBooleanProperty;
@@ -239,10 +240,6 @@ public final class MainWindowJavaFxSmokeTest {
                 assertEquals(List.of(image), filter.invoke(null, List.of(image), "Sipeed", "sipeed-licheerv"));
                 assertEquals(List.of(image), filter.invoke(null, List.of(image), "Allwinner", "awol-d1dev"));
                 assertEquals(List.of(), filter.invoke(null, List.of(image), "Allwinner", "sipeed-licheerv"));
-                var search = MainWindow.class.getDeclaredMethod("imageMatches", ImageEntry.class, String.class);
-                search.setAccessible(true);
-                assertEquals(true, search.invoke(null, image, "sipeed-licheerv"));
-                assertEquals(true, search.invoke(null, image, "alternate"));
                 var stateField = MainWindow.class.getDeclaredField("state");
                 stateField.setAccessible(true);
                 var constructor = stateField.getType().getDeclaredConstructor(
@@ -284,7 +281,7 @@ public final class MainWindowJavaFxSmokeTest {
             ImageEntry alternate = new ImageEntry("test", "image-combo", "alternate", "1.0.0", null,
                     "image-combo/alternate(1.0.0)", "Alternate image",
                     List.of(new ImageTarget("PLCT", "board-a", "sd")),
-                    "dd-v1", Map.of("disk", "alternate.img"), List.of(), StrategySupport.SUPPORTED, List.of());
+                    "dd-v1", Map.of(), List.of(), StrategySupport.SUPPORTED, List.of());
             var boards = MainWindow.class.getDeclaredMethod("boardOptions", List.class);
             boards.setAccessible(true);
             List<?> options = (List<?>) boards.invoke(null, List.of(shared, alternate));
@@ -300,6 +297,21 @@ public final class MainWindowJavaFxSmokeTest {
             matches.setAccessible(true);
             assertEquals(true, matches.invoke(null, board, "plct"));
             assertEquals(true, matches.invoke(null, board, "board-a"));
+            var boardPicker = MainWindow.class.getDeclaredMethod("boardSelectionContent", String.class, ListView.class, List.class);
+            boardPicker.setAccessible(true);
+            ListView<Object> boardList = new ListView<>();
+            Node boardContent = (Node) boardPicker.invoke(null, "Boards", boardList, options);
+            @SuppressWarnings("unchecked")
+            MFXComboBox<String> boardFilter = (MFXComboBox<String>) boardContent.lookup("#board-supplier-filter");
+            boardList.getSelectionModel().selectLast();
+            boardFilter.selectItem("Sipeed");
+            assertEquals(List.of(board), boardList.getItems());
+            assertNull(boardList.getSelectionModel().getSelectedItem());
+            TextField boardSearch = (TextField) boardContent.lookup(".selection-search");
+            boardSearch.setText("board-b");
+            assertTrue(boardList.getItems().isEmpty());
+            boardFilter.selectFirst();
+            assertEquals(List.of(options.getLast()), boardList.getItems());
 
             TreeView<MainWindow.OperatingSystemTreeNode> tree = MainWindow.selectionTreeView();
             VBox content = (VBox) MainWindow.operatingSystemSelectionContent("Images", tree,
@@ -309,14 +321,29 @@ public final class MainWindowJavaFxSmokeTest {
             content.applyCss();
             content.layout();
             @SuppressWarnings("unchecked")
-            MFXComboBox<String> filter = (MFXComboBox<String>) content.getChildren().get(1);
+            MFXComboBox<String> filter = (MFXComboBox<String>) content.lookup("#image-supplier-filter");
+            @SuppressWarnings("unchecked")
+            MFXComboBox<String> variants = (MFXComboBox<String>) content.lookup("#image-variant-filter");
             assertEquals(List.of("", "PLCT", "Sipeed"), filter.getItems());
             assertSame(shared, MainWindow.selectedTreeImage(tree));
+            TextField search = (TextField) content.lookup(".selection-search");
+            search.setText("board-b");
+            assertTrue(tree.getRoot().getChildren().isEmpty());
+            search.setText("");
             filter.selectItem("PLCT");
             assertNull(MainWindow.selectedTreeImage(tree));
             assertEquals(1, tree.getRoot().getChildren().size());
             assertEquals(1, tree.getRoot().getChildren().getFirst().getChildren().size());
             assertSame(alternate, tree.getRoot().getChildren().getFirst().getChildren().getFirst().getValue().image());
+            tree.getSelectionModel().select(tree.getRoot().getChildren().getFirst().getChildren().getFirst());
+            CheckBox flashable = (CheckBox) content.lookup(".check-box");
+            flashable.setSelected(true);
+            assertTrue(tree.getRoot().getChildren().isEmpty());
+            assertNull(MainWindow.selectedTreeImage(tree));
+            flashable.setSelected(false);
+            variants.selectItem("emmc");
+            assertTrue(tree.getRoot().getChildren().isEmpty());
+            variants.selectFirst();
             filter.selectFirst();
             assertNull(MainWindow.selectedTreeImage(tree));
             assertEquals(2, tree.getRoot().getChildren().stream()
