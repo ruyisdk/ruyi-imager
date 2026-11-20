@@ -18,6 +18,7 @@ import javafx.animation.KeyFrame;
 import javafx.animation.Timeline;
 import javafx.application.Platform;
 import javafx.scene.control.Button;
+import javafx.scene.control.CheckBox;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.property.ReadOnlyBooleanProperty;
@@ -183,9 +184,9 @@ public final class MainWindowJavaFxSmokeTest {
                 var stateField = MainWindow.class.getDeclaredField("state");
                 stateField.setAccessible(true);
                 Class<?> stateClass = stateField.getType();
-                var constructor = stateClass.getDeclaredConstructor(String.class, String.class, ImageEntry.class, Path.class, FlashTarget.class);
+                var constructor = stateClass.getDeclaredConstructor(String.class, ImageEntry.class, Path.class, FlashTarget.class);
                 constructor.setAccessible(true);
-                stateField.set(window, constructor.newInstance(null, null, null, directory.resolve("old.img"),
+                stateField.set(window, constructor.newInstance(null, null, directory.resolve("old.img"),
                         FlashTarget.blockDevice(blockDevice("old", directory.resolve("target")))));
                 ImageEntry image = image("board-image", "Local fastboot image", "generic", "fastboot-v1", Map.of("rootfs", "rootfs.img"));
                 var select = MainWindow.class.getDeclaredMethod("selectPreparedLocalImage", ImageEntry.class, ImageTarget.class);
@@ -231,23 +232,11 @@ public final class MainWindowJavaFxSmokeTest {
                                 new ImageTarget("Sipeed", "sipeed-licheerv", "generic"),
                                 new ImageTarget("Sipeed", "sipeed-licheerv", "alternate")),
                         "dd-v1", Map.of("disk", "image.img"), List.of(), StrategySupport.SUPPORTED, List.of());
-                var manufacturers = MainWindow.class.getDeclaredMethod("manufacturerOptions", List.class);
-                manufacturers.setAccessible(true);
-                List<?> options = (List<?>) manufacturers.invoke(null, List.of(image));
-                assertEquals(2, options.size());
-                for (Object option : options) {
-                    var count = option.getClass().getDeclaredMethod("imageCount");
-                    count.setAccessible(true);
-                    assertEquals(1, count.invoke(option));
-                    var boards = option.getClass().getDeclaredMethod("boardCount");
-                    boards.setAccessible(true);
-                    assertEquals(1, boards.invoke(option));
-                }
-                var boards = MainWindow.class.getDeclaredMethod("boardOptions", List.class, String.class);
+                var boards = MainWindow.class.getDeclaredMethod("boardOptions", List.class);
                 boards.setAccessible(true);
-                List<?> sipeedBoards = (List<?>) boards.invoke(null, List.of(image), "Sipeed");
-                assertEquals(1, sipeedBoards.size());
-                Object board = sipeedBoards.getFirst();
+                List<?> allBoards = (List<?>) boards.invoke(null, List.of(image));
+                assertEquals(2, allBoards.size());
+                Object board = allBoards.getLast();
                 var boardName = board.getClass().getDeclaredMethod("name");
                 boardName.setAccessible(true);
                 assertEquals("sipeed-licheerv", boardName.invoke(board));
@@ -259,25 +248,20 @@ public final class MainWindowJavaFxSmokeTest {
                 assertEquals(List.of(image), filter.invoke(null, List.of(image), "Sipeed", "sipeed-licheerv"));
                 assertEquals(List.of(image), filter.invoke(null, List.of(image), "Allwinner", "awol-d1dev"));
                 assertEquals(List.of(), filter.invoke(null, List.of(image), "Allwinner", "sipeed-licheerv"));
-                var search = MainWindow.class.getDeclaredMethod("imageMatches", ImageEntry.class, String.class);
-                search.setAccessible(true);
-                assertEquals(true, search.invoke(null, image, "sipeed-licheerv"));
-                assertEquals(true, search.invoke(null, image, "alternate"));
                 var stateField = MainWindow.class.getDeclaredField("state");
                 stateField.setAccessible(true);
                 var constructor = stateField.getType().getDeclaredConstructor(
-                        String.class, String.class, ImageEntry.class, Path.class, FlashTarget.class);
+                        String.class, ImageEntry.class, Path.class, FlashTarget.class);
                 constructor.setAccessible(true);
-                stateField.set(window, constructor.newInstance("Sipeed", "sipeed-licheerv", null, null, null));
+                stateField.set(window, constructor.newInstance("sipeed-licheerv", null, null, null));
                 var select = MainWindow.class.getDeclaredMethod("selectCatalogImage", ImageEntry.class);
                 select.setAccessible(true);
                 select.invoke(window, image);
                 Object state = stateField.get(window);
-                for (String field : List.of("manufacturerName", "boardName", "image")) {
+                for (String field : List.of("boardName", "image")) {
                     var accessor = stateField.getType().getDeclaredMethod(field);
                     accessor.setAccessible(true);
                     assertEquals(switch (field) {
-                        case "manufacturerName" -> "Sipeed";
                         case "boardName" -> "sipeed-licheerv";
                         default -> image;
                     }, accessor.invoke(state));
@@ -285,6 +269,129 @@ public final class MainWindowJavaFxSmokeTest {
                 var variants = MainWindow.class.getDeclaredMethod("imageVariants", ImageEntry.class);
                 variants.setAccessible(true);
                 assertEquals("alternate, generic", variants.invoke(window, image));
+            } finally {
+                window.shutdown();
+            }
+            return null;
+        });
+    }
+
+    /// Boards combine supplier catalogs while supplier filters retain target associations.
+    @Test
+    public void combinesSuppliersWithoutMixingBoardAssociations() throws Exception {
+        runOnJavaFxThread(() -> {
+            ImageEntry shared = new ImageEntry("test", "image-combo", "shared", "1.0.0", null,
+                    "image-combo/shared(1.0.0)", "Shared image",
+                    List.of(new ImageTarget("Sipeed", "board-a", "sd"),
+                            new ImageTarget("Sipeed", "board-a", "emmc"),
+                            new ImageTarget("PLCT", "board-b", "sd")),
+                    "dd-v1", Map.of("disk", "shared.img"), List.of(), StrategySupport.SUPPORTED, List.of());
+            ImageEntry alternate = new ImageEntry("test", "image-combo", "alternate", "1.0.0", null,
+                    "image-combo/alternate(1.0.0)", "Alternate image",
+                    List.of(new ImageTarget("PLCT", "board-a", "sd")),
+                    "dd-v1", Map.of(), List.of(), StrategySupport.SUPPORTED, List.of());
+            var boards = MainWindow.class.getDeclaredMethod("boardOptions", List.class);
+            boards.setAccessible(true);
+            List<?> options = (List<?>) boards.invoke(null, List.of(shared, alternate));
+            assertEquals(2, options.size());
+            Object board = options.getFirst();
+            var count = board.getClass().getDeclaredMethod("imageCount");
+            count.setAccessible(true);
+            assertEquals(2, count.invoke(board));
+            var suppliers = board.getClass().getDeclaredMethod("suppliers");
+            suppliers.setAccessible(true);
+            assertEquals(List.of("PLCT", "Sipeed"), suppliers.invoke(board));
+            var matches = MainWindow.class.getDeclaredMethod("boardMatches", board.getClass(), String.class);
+            matches.setAccessible(true);
+            assertEquals(true, matches.invoke(null, board, "plct"));
+            assertEquals(true, matches.invoke(null, board, "board-a"));
+            var boardPicker = MainWindow.class.getDeclaredMethod("boardSelectionContent", String.class, ListView.class, List.class);
+            boardPicker.setAccessible(true);
+            ListView<Object> boardList = new ListView<>();
+            Node boardContent = (Node) boardPicker.invoke(null, "Boards", boardList, options);
+            @SuppressWarnings("unchecked")
+            MFXComboBox<String> boardFilter = (MFXComboBox<String>) boardContent.lookup("#board-supplier-filter");
+            boardList.getSelectionModel().selectLast();
+            boardFilter.selectItem("Sipeed");
+            assertEquals(List.of(board), boardList.getItems());
+            assertNull(boardList.getSelectionModel().getSelectedItem());
+            TextField boardSearch = (TextField) boardContent.lookup(".selection-search");
+            boardSearch.setText("board-b");
+            assertTrue(boardList.getItems().isEmpty());
+            boardFilter.selectFirst();
+            assertEquals(List.of(options.getLast()), boardList.getItems());
+
+            TreeView<MainWindow.OperatingSystemTreeNode> tree = MainWindow.selectionTreeView();
+            VBox content = (VBox) MainWindow.operatingSystemSelectionContent("Images", tree,
+                    List.of(shared, alternate), shared, "board-a");
+            Scene scene = new Scene(content);
+            scene.getStylesheets().add(applicationStylesheet());
+            content.applyCss();
+            content.layout();
+            @SuppressWarnings("unchecked")
+            MFXComboBox<String> filter = (MFXComboBox<String>) content.lookup("#image-supplier-filter");
+            @SuppressWarnings("unchecked")
+            MFXComboBox<String> variants = (MFXComboBox<String>) content.lookup("#image-variant-filter");
+            assertEquals(List.of("", "PLCT", "Sipeed"), filter.getItems());
+            assertSame(shared, MainWindow.selectedTreeImage(tree));
+            TextField search = (TextField) content.lookup(".selection-search");
+            search.setText("board-b");
+            assertTrue(tree.getRoot().getChildren().isEmpty());
+            search.setText("");
+            filter.selectItem("PLCT");
+            assertNull(MainWindow.selectedTreeImage(tree));
+            assertEquals(1, tree.getRoot().getChildren().size());
+            assertEquals(1, tree.getRoot().getChildren().getFirst().getChildren().size());
+            assertSame(alternate, tree.getRoot().getChildren().getFirst().getChildren().getFirst().getValue().image());
+            tree.getSelectionModel().select(tree.getRoot().getChildren().getFirst().getChildren().getFirst());
+            CheckBox flashable = (CheckBox) content.lookup(".check-box");
+            flashable.setSelected(true);
+            assertTrue(tree.getRoot().getChildren().isEmpty());
+            assertNull(MainWindow.selectedTreeImage(tree));
+            flashable.setSelected(false);
+            variants.selectItem("emmc");
+            assertTrue(tree.getRoot().getChildren().isEmpty());
+            variants.selectFirst();
+            filter.selectFirst();
+            assertNull(MainWindow.selectedTreeImage(tree));
+            assertEquals(2, tree.getRoot().getChildren().stream()
+                    .mapToInt(category -> category.getChildren().size()).sum());
+            return null;
+        });
+    }
+
+    /// The board entry is available without a supplier and can replace a local image safely.
+    @Test
+    public void selectsBoardWithoutSupplierAndClearsPreviousDevice(@TempDir Path directory) throws Exception {
+        runOnJavaFxThread(() -> {
+            MainWindow window = new MainWindow(testServices(directory));
+            try {
+                assertFalse(((Button) windowField(window, "boardButton")).isDisabled());
+                assertTrue(((Button) windowField(window, "osButton")).isDisabled());
+                var field = MainWindow.class.getDeclaredField("state");
+                field.setAccessible(true);
+                Class<?> stateClass = field.getType();
+                var constructor = stateClass.getDeclaredConstructor(String.class,
+                        ImageEntry.class, Path.class, FlashTarget.class);
+                constructor.setAccessible(true);
+                field.set(window, constructor.newInstance(null, null, directory.resolve("local.img"),
+                        FlashTarget.blockDevice(blockDevice("old", directory.resolve("target")))));
+                var refresh = MainWindow.class.getDeclaredMethod("refreshState");
+                refresh.setAccessible(true);
+                refresh.invoke(window);
+                assertFalse(((Button) windowField(window, "boardButton")).isDisabled());
+                var select = MainWindow.class.getDeclaredMethod("selectBoard", String.class);
+                select.setAccessible(true);
+                select.invoke(window, "board-a");
+                Object state = field.get(window);
+                for (String property : List.of("image", "localImage", "target")) {
+                    var getter = stateClass.getDeclaredMethod(property);
+                    getter.setAccessible(true);
+                    assertNull(getter.invoke(state));
+                }
+                assertFalse(((Button) windowField(window, "osButton")).isDisabled());
+                assertTrue(((Button) windowField(window, "storageButton")).isDisabled());
+                assertTrue(((Button) windowField(window, "flashButton")).isDisabled());
             } finally {
                 window.shutdown();
             }
@@ -380,7 +487,7 @@ public final class MainWindowJavaFxSmokeTest {
                         Map.of("disk", "ubuntu.raw"));
 
                 TreeView<MainWindow.OperatingSystemTreeNode> treeView = MainWindow.selectionTreeView();
-                Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, List.of(revyos, ubuntu), revyos);
+                Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, List.of(revyos, ubuntu), revyos, null);
                 VBox contentBox = assertInstanceOf(VBox.class, content);
                 HBox headerRow = assertInstanceOf(HBox.class, contentBox.getChildren().get(0));
                 TextField searchField = assertInstanceOf(
@@ -479,7 +586,7 @@ public final class MainWindowJavaFxSmokeTest {
             BooleanBinding treeConfirm = MainWindow.selectionCanConfirm(treeView);
             assertFalse(treeConfirm.get());
 
-            MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null);
+            MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null, null);
             assertNull(treeView.getSelectionModel().getSelectedItem());
             assertFalse(treeConfirm.get());
 
@@ -619,10 +726,11 @@ public final class MainWindowJavaFxSmokeTest {
                         "Choose OS",
                         treeView,
                         manyImages(),
+                        null,
                         null);
                 VBox contentBox = assertInstanceOf(VBox.class, content);
-                assertEquals(3, contentBox.getChildren().size());
-                Label hint = assertInstanceOf(Label.class, contentBox.getChildren().get(2));
+                assertEquals(4, contentBox.getChildren().size());
+                Label hint = assertInstanceOf(Label.class, contentBox.getChildren().get(3));
                 assertTrue(hint.isVisible());
 
                 TreeItem<MainWindow.OperatingSystemTreeNode> category = treeView.getRoot().getChildren().getFirst();
@@ -666,14 +774,14 @@ public final class MainWindowJavaFxSmokeTest {
                         "Choose OS",
                         treeView,
                         List.of(revyos),
-                        revyos);
+                        revyos, null);
                 VBox contentBox = assertInstanceOf(VBox.class, content);
 
                 HBox headerRow = assertInstanceOf(HBox.class, contentBox.getChildren().get(0));
                 TextField searchField = assertInstanceOf(
                         TextField.class,
                         headerRow.getChildren().get(headerRow.getChildren().size() - 1));
-                StackPane selectionArea = assertInstanceOf(StackPane.class, contentBox.getChildren().get(1));
+                StackPane selectionArea = assertInstanceOf(StackPane.class, contentBox.getChildren().get(2));
                 assertEquals(2, selectionArea.getChildren().size());
                 VBox emptyHint = assertInstanceOf(VBox.class, selectionArea.getChildren().get(1));
 
@@ -724,7 +832,7 @@ public final class MainWindowJavaFxSmokeTest {
     public void showsOperatingSystemTreeScrollbar() throws Exception {
         runOnJavaFxThread(() -> {
             TreeView<MainWindow.OperatingSystemTreeNode> treeView = MainWindow.selectionTreeView();
-            Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null);
+            Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null, null);
             Parent parent = assertInstanceOf(Parent.class, content);
             Scene scene = new Scene(parent);
             @Nullable String stylesheet = applicationStylesheet();

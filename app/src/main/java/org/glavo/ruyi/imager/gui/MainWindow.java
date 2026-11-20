@@ -7,6 +7,7 @@ import javafx.animation.Animation;
 import javafx.animation.KeyFrame;
 import javafx.animation.Timeline;
 import javafx.application.Platform;
+import javafx.beans.InvalidationListener;
 import javafx.beans.Observable;
 import javafx.beans.binding.Bindings;
 import javafx.beans.binding.BooleanBinding;
@@ -25,6 +26,7 @@ import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonBase;
 import javafx.scene.control.Cell;
+import javafx.scene.control.CheckBox;
 import javafx.scene.control.Control;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListView;
@@ -118,6 +120,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -216,7 +221,7 @@ public final class MainWindow {
     private final BorderPane root;
 
     /// Current user selections.
-    private WizardState state = new WizardState(null, null, null, null, null);
+    private WizardState state = new WizardState(null, null, null, null);
 
     /// Status text shown in the top bar.
     private final Label statusLabel = new Label();
@@ -238,9 +243,6 @@ public final class MainWindow {
 
     /// Generation token used to ignore late progress events from a finished flash task.
     private long phaseProgressGeneration;
-
-    /// Manufacturer selection summary.
-    private final Label manufacturerValue = new Label();
 
     /// Board selection summary.
     private final Label boardValue = new Label();
@@ -268,9 +270,6 @@ public final class MainWindow {
 
     /// Active flash target summary.
     private final Label activeTargetValue = new Label();
-
-    /// Manufacturer selection button.
-    private final Button manufacturerButton = localizedButton("gui.button.chooseManufacturer");
 
     /// Board selection button.
     private final Button boardButton = localizedButton("gui.button.chooseBoard");
@@ -660,8 +659,6 @@ public final class MainWindow {
     ///
     /// @return workflow node.
     private VBox createWorkflow() {
-        manufacturerButton.setOnAction(_ -> chooseManufacturer());
-
         boardButton.setOnAction(_ -> chooseBoard());
 
         osButton.setOnAction(_ -> chooseOperatingSystem());
@@ -705,9 +702,8 @@ public final class MainWindow {
         catalogTitle.setMaxWidth(Double.MAX_VALUE);
 
         VBox catalogSteps = new VBox(12,
-                createStep("1", "gui.step.manufacturer", manufacturerValue, manufacturerButton),
-                createStep("2", "gui.step.board", boardValue, boardButton),
-                createStep("3", "gui.step.os", osValue, osButton, downloadOsButton));
+                createStep("1", "gui.step.board", boardValue, boardButton),
+                createStep("2", "gui.step.os", osValue, osButton, downloadOsButton));
 
         VBox catalogFlow = new VBox(12,
                 catalogTitle,
@@ -750,7 +746,7 @@ public final class MainWindow {
 
         selectionControlsBox.getChildren().setAll(
                 sourceChoices,
-                createStep("4", targetTitle, storageValue, storageButton),
+                createStep("3", targetTitle, storageValue, storageButton),
                 writeActions);
         selectionControlsBox.getStyleClass().add("selection-controls-box");
         selectionControlsBox.setFillWidth(true);
@@ -952,14 +948,21 @@ public final class MainWindow {
             ListView<T> listView,
             List<T> items,
             BiPredicate<T, String> matcher) {
+        return searchableSelectionContent(header, listView, items, matcher, null);
+    }
+
+    /// Combines the text matcher with an optional catalog filter observed by the matcher.
+    private static <T> Node searchableSelectionContent(
+            String header, ListView<T> listView, List<T> items, BiPredicate<T, String> matcher,
+            @Nullable MFXComboBox<String> filter) {
         TextField searchField = selectionSearchField();
 
         FilteredList<T> filteredItems = new FilteredList<>(FXCollections.observableArrayList(items));
         listView.setItems(filteredItems);
-        searchField.textProperty().addListener((_, _, value) -> {
-            String query = normalizeSearchQuery(value);
+        Runnable refresh = () -> {
+            String query = normalizeSearchQuery(searchField.getText());
             @Nullable T selected = listView.getSelectionModel().getSelectedItem();
-            filteredItems.setPredicate(item -> query.isEmpty() || matcher.test(item, query));
+            filteredItems.setPredicate(item -> (query.isEmpty() && filter == null) || matcher.test(item, query));
             // Filtering never selects an item on the user's behalf: it either restores the item the
             // user chose or drops the selection, so the dialog cannot confirm a hidden item or one
             // that the rebuild pushed onto the selected index.
@@ -968,12 +971,19 @@ public final class MainWindow {
             } else {
                 listView.getSelectionModel().clearSelection();
             }
-        });
+        };
+        searchField.textProperty().addListener((_, _, _) -> refresh.run());
+        if (filter != null) {
+            filter.getSelectionModel().selection().addListener((Observable _) -> refresh.run());
+        }
 
         BooleanBinding listEmpty = Bindings.isEmpty(filteredItems);
         StackPane listArea = selectionEmptyState(listView, listEmpty);
         Label selectHint = selectionRequiredHint(selectionCanConfirm(listView).not(), listEmpty);
         VBox content = new VBox(10, selectionHeaderRow(header, searchField), listArea, selectHint);
+        if (filter != null) {
+            content.getChildren().add(1, filter);
+        }
         content.setMinWidth(SELECTION_LIST_WIDTH);
         content.setPrefWidth(SELECTION_LIST_WIDTH);
         content.setMaxWidth(SELECTION_LIST_WIDTH);
@@ -1095,36 +1105,93 @@ public final class MainWindow {
         return row;
     }
 
-    /// Wraps an operating system tree with search.
+    /// Builds a filter showing localized supplier names while matching metadata identifiers.
+    private static MFXComboBox<String> supplierFilter(String id, Stream<String> suppliers) {
+        return catalogFilter(id, "gui.image.supplier", "gui.image.allSuppliers", suppliers, ManufacturerNames::displayName);
+    }
+
+    /// Builds a single-selection catalog filter with an unrestricted first option.
+    private static MFXComboBox<String> catalogFilter(String id, String labelKey, String allKey,
+            Stream<String> values, Function<String, String> displayName) {
+        MFXComboBox<String> filter = new MFXComboBox<>();
+        filter.setAllowEdit(false);
+        filter.getSelectionModel().setAllowsMultipleSelection(false);
+        filter.setId(id);
+        filter.setAccessibleText(Messages.get(labelKey));
+        filter.setPrefWidth(180);
+        filter.setMaxWidth(180);
+        filter.getItems().add("");
+        filter.getItems().addAll(values.filter(value -> !value.isBlank()).distinct().sorted().toList());
+        filter.setConverter(new StringConverter<>() {
+            /// Displays the filter label without changing its metadata value.
+            @Override
+            public String toString(@Nullable String value) {
+                return value == null || value.isEmpty() ? Messages.get(allKey) : displayName.apply(value);
+            }
+
+            /// Returns the unchanged value for this non-editable selector.
+            @Override
+            public String fromString(String value) {
+                return value;
+            }
+        });
+        filter.selectFirst();
+        filter.setText(Messages.get(allKey));
+        return filter;
+    }
+
+    /// Wraps an operating system tree with search, supplier, variant, and writer support filters.
     ///
     /// @param header header text.
     /// @param treeView operating system tree view.
     /// @param images source image entries.
     /// @param currentImage currently selected image.
+    /// @param boardName selected board, or null to include all targets.
     /// @return operating system selection content.
     static Node operatingSystemSelectionContent(
             String header,
             TreeView<OperatingSystemTreeNode> treeView,
             List<ImageEntry> images,
-            @Nullable ImageEntry currentImage) {
+            @Nullable ImageEntry currentImage,
+            @Nullable String boardName) {
         TextField searchField = selectionSearchField();
+        @Unmodifiable List<ImageTarget> targets = images.stream().flatMap(image -> image.targets().stream())
+                .filter(target -> target.matches(null, boardName)).distinct().toList();
+        MFXComboBox<String> supplierFilter = supplierFilter("image-supplier-filter", targets.stream().map(ImageTarget::manufacturer));
+        MFXComboBox<String> variantFilter = catalogFilter("image-variant-filter", "gui.image.variant",
+                "gui.image.allVariants", targets.stream().map(ImageTarget::variant), Function.identity());
+        CheckBox flashableOnly = new CheckBox(Messages.get("gui.image.flashableOnly"));
+        HBox filters = new HBox(10, supplierFilter, variantFilter, flashableOnly);
+        filters.setAlignment(Pos.CENTER_LEFT);
 
         BooleanProperty treeEmpty = new SimpleBooleanProperty();
-        Runnable refreshTree = () -> {
+        Consumer<@Nullable ImageEntry> refreshTree = selected -> {
             String query = normalizeSearchQuery(searchField.getText());
+            @Nullable String supplier = supplierFilter.getSelectedItem();
+            @Nullable String variant = variantFilter.getSelectedItem();
+            Predicate<ImageTarget> matchesTarget = target ->
+                    target.matches(supplier == null || supplier.isEmpty() ? null : supplier, boardName)
+                            && (variant == null || variant.isEmpty() || variant.equals(target.variant()));
+            @Unmodifiable List<ImageEntry> filtered = images.stream()
+                    .filter(image -> !flashableOnly.isSelected() || catalogImageFlashable(image))
+                    .filter(image -> image.targets().stream().anyMatch(matchesTarget))
+                    .toList();
             // Only the initial population restores the current image. Later refreshes keep whatever
             // the user selected, so filtering never brings back an image the filter hid.
-            populateOperatingSystemTree(treeView, images, query, selectedTreeImage(treeView));
+            populateOperatingSystemTree(treeView, filtered, query, matchesTarget, selected);
             treeEmpty.set(treeView.getRoot() == null || treeView.getRoot().getChildren().isEmpty());
         };
 
-        searchField.textProperty().addListener((_, _, _) -> refreshTree.run());
-        populateOperatingSystemTree(treeView, images, "", currentImage);
-        treeEmpty.set(treeView.getRoot() == null || treeView.getRoot().getChildren().isEmpty());
+        InvalidationListener changed = _ -> refreshTree.accept(selectedTreeImage(treeView));
+        searchField.textProperty().addListener(changed);
+        supplierFilter.getSelectionModel().selection().addListener(changed);
+        variantFilter.getSelectionModel().selection().addListener(changed);
+        flashableOnly.selectedProperty().addListener(changed);
+        refreshTree.accept(currentImage);
 
         StackPane treeArea = selectionEmptyState(treeView, treeEmpty);
         Label selectHint = selectionRequiredHint(selectionCanConfirm(treeView).not(), treeEmpty);
-        VBox content = new VBox(10, selectionHeaderRow(header, searchField), treeArea, selectHint);
+        VBox content = new VBox(10, selectionHeaderRow(header, searchField), filters, treeArea, selectHint);
         content.setMinWidth(SELECTION_LIST_WIDTH);
         content.setPrefWidth(SELECTION_LIST_WIDTH);
         content.setMaxWidth(SELECTION_LIST_WIDTH);
@@ -1139,11 +1206,13 @@ public final class MainWindow {
     /// @param treeView operating system tree view.
     /// @param images source image entries.
     /// @param query normalized search query.
+    /// @param matchesTarget limits target-specific search terms to the active filters.
     /// @param selectedImage image to select after rebuilding.
     private static void populateOperatingSystemTree(
             TreeView<OperatingSystemTreeNode> treeView,
             List<ImageEntry> images,
             String query,
+            Predicate<ImageTarget> matchesTarget,
             @Nullable ImageEntry selectedImage) {
         TreeItem<OperatingSystemTreeNode> root = new TreeItem<>(
                 new OperatingSystemTreeNode("", null, 0));
@@ -1157,7 +1226,7 @@ public final class MainWindow {
             ArrayList<ImageEntry> matchingImages = new ArrayList<>();
             for (ImageEntry image : images) {
                 if (operatingSystemCategoryId(image).equals(category.id())
-                        && (query.isEmpty() || categoryMatches || imageMatches(image, query))) {
+                        && (query.isEmpty() || categoryMatches || imageMatches(image, query, matchesTarget))) {
                     matchingImages.add(image);
                 }
             }
@@ -1447,7 +1516,7 @@ public final class MainWindow {
         startBackgroundTask(task, result -> {
             if (result.success()) {
                 recordMetadataUpdateSuccess();
-                state = new WizardState(null, null, null, null, null);
+                state = new WizardState(null, null, null, null);
                 refreshState();
             }
             settings.metadataUpdateFinished(result.success(), result.message());
@@ -1490,8 +1559,8 @@ public final class MainWindow {
                 || Duration.between(updatedAt, now).compareTo(METADATA_AUTO_UPDATE_INTERVAL) >= 0;
     }
 
-    /// Opens the manufacturer selection dialog.
-    private void chooseManufacturer() {
+    /// Loads or refreshes metadata before opening the complete board list.
+    private void chooseBoard() {
         Task<CatalogLoadResult> task = new Task<>() {
             /// Loads the image catalog outside the JavaFX application thread.
             ///
@@ -1502,8 +1571,8 @@ public final class MainWindow {
                 boolean hasLocalMetadata = services.repository().hasLocalMetadata();
                 if (!hasLocalMetadata || automaticMetadataUpdateDue()) {
                     LOGGER.atInfo().log(() -> hasLocalMetadata
-                            ? "Local repository metadata is stale; updating before manufacturer selection."
-                            : "Local repository metadata is missing; updating before manufacturer selection.");
+                            ? "Local repository metadata is stale; updating before board selection."
+                            : "Local repository metadata is missing; updating before board selection.");
                     updateMessage(Messages.get("gui.progress.updatingMetadata"));
                     try {
                         OperationResult result = services.repository().update(LoggingProgressReporter.wrap(event -> {
@@ -1538,89 +1607,28 @@ public final class MainWindow {
 
         startBackgroundTask(task, Messages.get("gui.dialog.imageError"), result -> {
             if (result.metadataUpdated()) {
-                state = new WizardState(null, null, null, null, null);
+                state = new WizardState(null, null, null, null);
                 refreshState();
             }
-            showManufacturerDialog(result.catalog());
+            showBoardDialog(result.catalog());
         });
-    }
-
-    /// Shows the manufacturer selection dialog.
-    ///
-    /// @param catalog image catalog.
-    private void showManufacturerDialog(ImageCatalog catalog) {
-        @Unmodifiable List<ManufacturerOption> manufacturers = manufacturerOptions(catalog.images());
-        if (manufacturers.isEmpty()) {
-            showInfo(Messages.get("gui.dialog.noManufacturers"), Messages.get("gui.dialog.noManufacturers.message"));
-            return;
-        }
-
-        ListView<ManufacturerOption> listView = selectionListView();
-        String header = Messages.get("gui.dialog.chooseManufacturer.header");
-        Node content = searchableSelectionContent(header, listView, manufacturers, MainWindow::manufacturerMatches);
-        listView.setCellFactory(_ -> new MFXLegacyListCell<>() {
-            /// Updates one manufacturer list cell.
-            ///
-            /// @param item manufacturer option.
-            /// @param empty whether the cell is empty.
-            @Override
-            protected void updateItem(@Nullable ManufacturerOption item, boolean empty) {
-                super.updateItem(item, empty);
-                setText(empty || item == null ? null
-                        : Messages.get(
-                        "gui.list.manufacturer",
-                        item.displayName(),
-                        item.boardCount(),
-                        item.imageCount()));
-            }
-        });
-        selectCurrentManufacturer(listView, state.manufacturerName());
-
-        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseManufacturer"), content, listView, selectionCanConfirm(listView))) {
-            ManufacturerOption selected = listView.getSelectionModel().getSelectedItem();
-            if (selected != null) {
-                state = new WizardState(selected.name(), null, null, null, state.target());
-                refreshState();
-            }
-        }
-    }
-
-    /// Opens the board selection dialog.
-    private void chooseBoard() {
-        if (state.manufacturerName() == null) {
-            showInfo(Messages.get("gui.dialog.incompleteSelection"), Messages.get("gui.dialog.selectManufacturerFirst"));
-            return;
-        }
-
-        Task<ImageCatalog> task = new Task<>() {
-            /// Loads the image catalog outside the JavaFX application thread.
-            ///
-            /// @return image catalog.
-            @Override
-            protected ImageCatalog call() throws Exception {
-                updateMessage(Messages.get("gui.progress.loadingCatalog"));
-                return services.images().listImages();
-            }
-        };
-
-        startBackgroundTask(task, Messages.get("gui.dialog.imageError"), this::showBoardDialog);
     }
 
     /// Shows the board selection dialog.
     ///
     /// @param catalog image catalog.
     private void showBoardDialog(ImageCatalog catalog) {
-        @Unmodifiable List<BoardOption> boards = boardOptions(catalog.images(), state.manufacturerName());
+        @Unmodifiable List<BoardOption> boards = boardOptions(catalog.images());
         if (boards.isEmpty()) {
             showInfo(
                     Messages.get("gui.dialog.noBoards"),
-                    Messages.get("gui.dialog.noBoards.message", selectedManufacturerDisplayName()));
+                    Messages.get("gui.dialog.noBoards.message"));
             return;
         }
 
         ListView<BoardOption> listView = selectionListView();
-        String header = Messages.get("gui.dialog.chooseBoard.header", selectedManufacturerDisplayName());
-        Node content = searchableSelectionContent(header, listView, boards, MainWindow::boardMatches);
+        String header = Messages.get("gui.dialog.chooseBoard.header");
+        Node content = boardSelectionContent(header, listView, boards);
         listView.setCellFactory(_ -> new MFXLegacyListCell<>() {
             /// Updates one board list cell.
             ///
@@ -1629,7 +1637,8 @@ public final class MainWindow {
             @Override
             protected void updateItem(@Nullable BoardOption item, boolean empty) {
                 super.updateItem(item, empty);
-                setText(empty || item == null ? null : Messages.get("gui.list.board", item.name(), item.imageCount()));
+                setText(empty || item == null ? null : Messages.get("gui.list.board", item.name(), item.imageCount(),
+                        String.join(", ", item.suppliers().stream().map(ManufacturerNames::displayName).toList())));
             }
         });
         selectCurrentBoard(listView, state.boardName());
@@ -1637,18 +1646,36 @@ public final class MainWindow {
         if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseBoard"), content, listView, selectionCanConfirm(listView))) {
             BoardOption selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
-                state = new WizardState(state.manufacturerName(), selected.name(), null, null, state.target());
-                refreshState();
+                selectBoard(selected.name());
             }
         }
     }
 
+    /// Filters the complete board list without making a supplier a required selection.
+    private static Node boardSelectionContent(String header, ListView<BoardOption> list, List<BoardOption> boards) {
+        MFXComboBox<String> filter = supplierFilter("board-supplier-filter",
+                boards.stream().flatMap(board -> board.suppliers().stream()));
+        return searchableSelectionContent(header, list, boards, (board, query) -> {
+            @Nullable String supplier = filter.getSelectedItem();
+            return (supplier == null || supplier.isEmpty() || board.suppliers().contains(supplier))
+                    && (query.isEmpty() || boardMatches(board, query));
+        }, filter);
+    }
+
+    /// Selects a board across suppliers and clears the previous source and device.
+    ///
+    /// @param boardName selected board name.
+    private void selectBoard(String boardName) {
+        state = new WizardState(boardName, null, null, null);
+        refreshState();
+    }
+
     /// Opens the operating system selection dialog.
     private void chooseOperatingSystem() {
-        if (state.manufacturerName() == null || state.boardName() == null) {
+        if (state.boardName() == null) {
             showInfo(
                     Messages.get("gui.dialog.incompleteSelection"),
-                    Messages.get("gui.dialog.selectManufacturerAndBoardFirst"));
+                    Messages.get("gui.dialog.selectBoardFirst"));
             return;
         }
 
@@ -1670,7 +1697,7 @@ public final class MainWindow {
     ///
     /// @param catalog image catalog.
     private void showOperatingSystemDialog(ImageCatalog catalog) {
-        @Unmodifiable List<ImageEntry> images = filteredImages(catalog.images(), state.manufacturerName(), state.boardName());
+        @Unmodifiable List<ImageEntry> images = filteredImages(catalog.images(), null, state.boardName());
         if (images.isEmpty()) {
             showInfo(Messages.get("gui.dialog.noOperatingSystems"), imageEmptyMessage());
             return;
@@ -1679,7 +1706,7 @@ public final class MainWindow {
         TreeView<OperatingSystemTreeNode> treeView = selectionTreeView();
         @Unmodifiable Map<String, ImageCacheStatus> cacheStatuses = imageCacheStatuses(images);
         String header = Messages.get("gui.dialog.chooseOperatingSystem.header", state.boardName());
-        Node content = operatingSystemSelectionContent(header, treeView, images, state.image());
+        Node content = operatingSystemSelectionContent(header, treeView, images, state.image(), state.boardName());
         treeView.setCellFactory(_ -> new TreeCell<>() {
             /// Updates one operating system tree cell.
             ///
@@ -1718,11 +1745,11 @@ public final class MainWindow {
         }
     }
 
-    /// Stores a catalog selection while preserving the chosen manufacturer and board.
+    /// Stores a catalog selection for the chosen board without restricting its supplier.
     ///
     /// @param image image selected from the filtered catalog.
     private void selectCatalogImage(ImageEntry image) {
-        state = new WizardState(state.manufacturerName(), state.boardName(), image, null,
+        state = new WizardState(state.boardName(), image, null,
                 compatibleTarget(state.target(), image, null));
         refreshState();
     }
@@ -1835,7 +1862,7 @@ public final class MainWindow {
 
     /// Stores an explicitly requested raw write and clears any previously selected device.
     private void selectRawLocalImage(Path source) {
-        state = new WizardState(null, null, null, source, null);
+        state = new WizardState(null, null, source, null);
         refreshState();
     }
 
@@ -1864,7 +1891,7 @@ public final class MainWindow {
 
     /// Activates a prepared image and requires a fresh physical device selection.
     private void selectPreparedLocalImage(ImageEntry image, ImageTarget target) {
-        state = new WizardState(target.manufacturer(), target.board(), image, null, null);
+        state = new WizardState(target.board(), image, null, null);
         refreshState();
     }
 
@@ -1987,7 +2014,6 @@ public final class MainWindow {
             FastbootDevice selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
                 state = new WizardState(
-                        state.manufacturerName(),
                         state.boardName(),
                         state.image(),
                         state.localImage(),
@@ -2049,7 +2075,6 @@ public final class MainWindow {
             BlockDevice selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
                 state = new WizardState(
-                        state.manufacturerName(),
                         state.boardName(),
                         state.image(),
                         state.localImage(),
@@ -2141,7 +2166,6 @@ public final class MainWindow {
             @Nullable FlashTarget selectedTarget = partitionTargetSelection(selectors);
             if (selectedTarget != null) {
                 state = new WizardState(
-                        state.manufacturerName(),
                         state.boardName(),
                         state.image(),
                         state.localImage(),
@@ -2986,7 +3010,6 @@ public final class MainWindow {
 
     /// Refreshes labels and enabled states from the current selections.
     private void refreshState() {
-        manufacturerValue.setText(manufacturerLabel());
         boardValue.setText(boardLabel());
         osValue.setText(osLabel());
         localImageValue.setText(localImageLabel());
@@ -3002,11 +3025,9 @@ public final class MainWindow {
         activeFlashBox.setVisible(showActiveFlashBox);
         activeFlashBox.setManaged(showActiveFlashBox);
         settingsButton.setDisable(busy.get());
-        manufacturerButton.setDisable(busy.get());
-        boardButton.setDisable(busy.get() || state.localImage() != null || state.manufacturerName() == null);
+        boardButton.setDisable(busy.get());
         osButton.setDisable(busy.get()
                 || state.localImage() != null
-                || state.manufacturerName() == null
                 || state.boardName() == null);
         @Nullable ImageEntry selectedImage = state.image();
         downloadOsButton.setDisable(busy.get()
@@ -3284,26 +3305,17 @@ public final class MainWindow {
         summary.add(valueLabel, 1, row);
     }
 
-    /// Formats the manufacturer step label.
+    /// Formats the suppliers associated with the selected image target.
     ///
-    /// @return manufacturer step label.
+    /// @return supplier summary.
     private String manufacturerLabel() {
         if (state.localImage() != null) {
             return Messages.get("gui.value.skippedLocal");
         }
-        return state.manufacturerName() == null
+        @Nullable ImageEntry image = state.image();
+        return image == null
                 ? Messages.get("gui.value.manufacturer.none")
-                : selectedManufacturerDisplayName();
-    }
-
-    /// Formats the selected manufacturer for display.
-    ///
-    /// @return selected manufacturer display name.
-    private String selectedManufacturerDisplayName() {
-        @Nullable String manufacturerName = state.manufacturerName();
-        return manufacturerName == null
-                ? Messages.get("gui.value.manufacturer.none")
-                : ManufacturerNames.displayName(manufacturerName);
+                : imageSuppliers(image);
     }
 
     /// Formats the board step label.
@@ -3359,61 +3371,27 @@ public final class MainWindow {
         return Messages.get("gui.value.os.none");
     }
 
-    /// Builds manufacturer choices from image metadata.
+    /// Builds board choices across suppliers, counting each image once per board.
     ///
     /// @param images available images.
-    /// @return manufacturer options sorted by manufacturer name.
-    private static @Unmodifiable List<ManufacturerOption> manufacturerOptions(List<ImageEntry> images) {
-        Map<String, Integer> imageCounts = new LinkedHashMap<>();
-        Map<String, List<String>> boardNames = new LinkedHashMap<>();
-        for (ImageEntry image : images) {
-            Set<String> manufacturers = new HashSet<>();
-            for (ImageTarget target : image.targets()) {
-                String manufacturer = target.manufacturer();
-                if (manufacturers.add(manufacturer)) {
-                    imageCounts.merge(manufacturer, 1, Integer::sum);
-                }
-                List<String> boards = boardNames.computeIfAbsent(manufacturer, _ -> new ArrayList<>());
-                if (!boards.contains(target.board())) {
-                    boards.add(target.board());
-                }
-            }
-        }
-
-        ArrayList<ManufacturerOption> manufacturers = new ArrayList<>(imageCounts.size());
-        for (Map.Entry<String, Integer> entry : imageCounts.entrySet()) {
-            List<String> boards = boardNames.get(entry.getKey());
-            manufacturers.add(new ManufacturerOption(
-                    entry.getKey(),
-                    ManufacturerNames.displayName(entry.getKey()),
-                    boards == null ? 0 : boards.size(),
-                    entry.getValue()));
-        }
-        manufacturers.sort(Comparator.comparing(ManufacturerOption::displayName).thenComparing(ManufacturerOption::name));
-        return List.copyOf(manufacturers);
-    }
-
-    /// Builds board choices from image metadata.
-    ///
-    /// @param images available images.
-    /// @param manufacturerName selected manufacturer name.
     /// @return board options sorted by board name.
-    private static @Unmodifiable List<BoardOption> boardOptions(
-            List<ImageEntry> images,
-            @Nullable String manufacturerName) {
+    private static @Unmodifiable List<BoardOption> boardOptions(List<ImageEntry> images) {
         Map<String, Integer> counts = new LinkedHashMap<>();
+        Map<String, Set<String>> suppliers = new LinkedHashMap<>();
         for (ImageEntry image : images) {
             Set<String> boards = new HashSet<>();
             for (ImageTarget target : image.targets()) {
-                if (target.matches(manufacturerName, null) && boards.add(target.board())) {
+                if (boards.add(target.board())) {
                     counts.merge(target.board(), 1, Integer::sum);
                 }
+                suppliers.computeIfAbsent(target.board(), _ -> new HashSet<>()).add(target.manufacturer());
             }
         }
 
         ArrayList<BoardOption> boards = new ArrayList<>(counts.size());
         for (Map.Entry<String, Integer> entry : counts.entrySet()) {
-            boards.add(new BoardOption(entry.getKey(), entry.getValue()));
+            boards.add(new BoardOption(entry.getKey(), entry.getValue(),
+                    suppliers.get(entry.getKey()).stream().sorted().toList()));
         }
         boards.sort(Comparator.comparing(BoardOption::name));
         return List.copyOf(boards);
@@ -3581,28 +3559,6 @@ public final class MainWindow {
         return Character.toUpperCase(lower.charAt(0)) + lower.substring(1);
     }
 
-    /// Restores the current manufacturer when the dialog opens.
-    ///
-    /// The dialog never selects an item on the user's behalf: nothing is selected unless the user
-    /// previously chose a manufacturer and it is still offered.
-    ///
-    /// @param listView manufacturer list view.
-    /// @param manufacturerName selected manufacturer name.
-    private static void selectCurrentManufacturer(
-            ListView<ManufacturerOption> listView,
-            @Nullable String manufacturerName) {
-        if (manufacturerName == null) {
-            return;
-        }
-
-        for (int i = 0; i < listView.getItems().size(); i++) {
-            if (listView.getItems().get(i).name().equals(manufacturerName)) {
-                listView.getSelectionModel().select(i);
-                return;
-            }
-        }
-    }
-
     /// Restores the current board when the dialog opens.
     ///
     /// The dialog never selects an item on the user's behalf: nothing is selected unless the user
@@ -3679,21 +3635,6 @@ public final class MainWindow {
         return null;
     }
 
-    /// Returns whether a manufacturer option matches a search query.
-    ///
-    /// @param manufacturer manufacturer option.
-    /// @param query normalized query.
-    /// @return whether the option matches.
-    private static boolean manufacturerMatches(ManufacturerOption manufacturer, String query) {
-        return textMatches(manufacturer.name(), query)
-                || textMatches(manufacturer.displayName(), query)
-                || textMatches(Messages.get(
-                "gui.list.manufacturer",
-                manufacturer.displayName(),
-                manufacturer.boardCount(),
-                manufacturer.imageCount()), query);
-    }
-
     /// Returns whether a board option matches a search query.
     ///
     /// @param board board option.
@@ -3701,7 +3642,8 @@ public final class MainWindow {
     /// @return whether the option matches.
     private static boolean boardMatches(BoardOption board, String query) {
         return textMatches(board.name(), query)
-                || textMatches(Messages.get("gui.list.board", board.name(), board.imageCount()), query);
+                || board.suppliers().stream().anyMatch(supplier -> textMatches(supplier, query)
+                        || textMatches(ManufacturerNames.displayName(supplier), query));
     }
 
     /// Returns whether an image entry matches a search query.
@@ -3709,10 +3651,10 @@ public final class MainWindow {
     /// @param image image entry.
     /// @param query normalized query.
     /// @return whether the image matches.
-    private static boolean imageMatches(ImageEntry image, String query) {
+    private static boolean imageMatches(ImageEntry image, String query, Predicate<ImageTarget> matchesTarget) {
         return textMatches(image.displayName(), query)
                 || textMatches(operatingSystemCategoryName(image), query)
-                || image.targets().stream().anyMatch(target -> textMatches(target.manufacturer(), query)
+                || image.targets().stream().filter(matchesTarget).anyMatch(target -> textMatches(target.manufacturer(), query)
                         || textMatches(ManufacturerNames.displayName(target.manufacturer()), query)
                         || textMatches(target.board(), query)
                         || textMatches(target.variant(), query))
@@ -3826,7 +3768,8 @@ public final class MainWindow {
                 "gui.image.details",
                 imageVariants(image),
                 image.strategy(),
-                imageCacheStatusLabel(cacheStatus)));
+                imageCacheStatusLabel(cacheStatus),
+                imageSuppliers(image)));
         details.setWrapText(true);
         details.getStyleClass().add("selection-detail");
 
@@ -3915,16 +3858,31 @@ public final class MainWindow {
                 imageVariants(image),
                 image.strategy(),
                 imageSupportLabel(image),
-                imageCacheStatusLabel(cacheStatus));
+                imageCacheStatusLabel(cacheStatus),
+                imageSuppliers(image));
     }
 
-    /// Formats the distinct image variants associated with the selected manufacturer and board.
+    /// Formats suppliers for the selected board, or all targets when no board is selected.
+    ///
+    /// @param image image entry.
+    /// @return distinct localized supplier names.
+    private String imageSuppliers(ImageEntry image) {
+        return String.join(", ", image.targets().stream()
+                .filter(target -> target.matches(null, state.boardName()))
+                .map(ImageTarget::manufacturer)
+                .map(ManufacturerNames::displayName)
+                .distinct()
+                .sorted()
+                .toList());
+    }
+
+    /// Formats the distinct image variants associated with the selected board.
     ///
     /// @param image image entry.
     /// @return comma-separated variants matching the current selection.
     private String imageVariants(ImageEntry image) {
         return String.join(", ", image.targets().stream()
-                .filter(target -> target.matches(state.manufacturerName(), state.boardName()))
+                .filter(target -> target.matches(null, state.boardName()))
                 .map(ImageTarget::variant)
                 .distinct()
                 .sorted()
@@ -4598,7 +4556,7 @@ public final class MainWindow {
         LATER
     }
 
-    /// Result of loading the image catalog for manufacturer selection.
+    /// Result of loading the image catalog for board selection.
     ///
     /// @param catalog loaded image catalog.
     /// @param metadataUpdated whether repository metadata was refreshed before loading.
@@ -4608,36 +4566,25 @@ public final class MainWindow {
 
     /// Holds the current guided workflow selections.
     ///
-    /// @param manufacturerName selected manufacturer name.
     /// @param boardName selected board name.
     /// @param image selected operating system image.
     /// @param localImage selected local image file.
     /// @param target selected target device.
     @NotNullByDefault
     private record WizardState(
-            @Nullable String manufacturerName,
             @Nullable String boardName,
             @Nullable ImageEntry image,
             @Nullable Path localImage,
             @Nullable FlashTarget target) {
     }
 
-    /// Manufacturer option derived from image metadata.
-    ///
-    /// @param name manufacturer metadata name.
-    /// @param displayName localized manufacturer display name.
-    /// @param boardCount number of boards available for the manufacturer.
-    /// @param imageCount number of images available for the manufacturer.
-    @NotNullByDefault
-    private record ManufacturerOption(String name, String displayName, int boardCount, int imageCount) {
-    }
-
     /// Board option derived from image metadata.
     ///
     /// @param name board name.
     /// @param imageCount number of images available for the board.
+    /// @param suppliers supplier identifiers associated with the board.
     @NotNullByDefault
-    private record BoardOption(String name, int imageCount) {
+    private record BoardOption(String name, int imageCount, @Unmodifiable List<String> suppliers) {
     }
 
     /// Operating system category alias used for image metadata inference.
