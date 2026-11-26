@@ -270,11 +270,14 @@ public final class MainWindowJavaFxSmokeTest {
             MFXComboBox<MainWindow.FilterChoice> variants = (MFXComboBox<MainWindow.FilterChoice>) content.lookup("#image-variant-filter");
             assertEquals(3, tree.getRoot().getChildren().stream().mapToInt(group -> group.getChildren().size()).sum());
             boards.selectItem(new MainWindow.FilterChoice(""));
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("PLCT")), filter.getItems());
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("generic")), variants.getItems());
             assertSame(unassigned, tree.getRoot().getChildren().getFirst().getChildren().getFirst().getValue().image());
             boards.selectFirst();
             TextField search = (TextField) content.lookup(".selection-search");
             search.setText("board-b");
             assertEquals(1, tree.getRoot().getChildren().stream().mapToInt(group -> group.getChildren().size()).sum());
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("board-b")), boards.getItems());
             var match = tree.getRoot().getChildren().getFirst().getChildren().getFirst();
             assertSame(shared, match.getValue().image());
             tree.getSelectionModel().select(match);
@@ -285,6 +288,7 @@ public final class MainWindowJavaFxSmokeTest {
             assertTrue(tree.getRoot().getChildren().isEmpty());
             search.setText("");
             filter.selectItem(new MainWindow.FilterChoice("PLCT"));
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("sd")), variants.getItems());
             assertNull(MainWindow.selectedTreeImage(tree));
             assertEquals(1, tree.getRoot().getChildren().size());
             assertEquals(1, tree.getRoot().getChildren().getFirst().getChildren().size());
@@ -294,14 +298,23 @@ public final class MainWindowJavaFxSmokeTest {
             flashable.setSelected(true);
             assertTrue(tree.getRoot().getChildren().isEmpty());
             assertNull(MainWindow.selectedTreeImage(tree));
+            assertEquals("board-a", boards.getSelectedItem().value());
+            assertEquals("PLCT", filter.getSelectedItem().value());
+            assertEquals(List.of(new MainWindow.FilterChoice(null)), variants.getItems());
             flashable.setSelected(false);
-            variants.selectItem(new MainWindow.FilterChoice("emmc"));
-            assertTrue(tree.getRoot().getChildren().isEmpty());
-            variants.selectFirst();
             filter.selectFirst();
             assertNull(MainWindow.selectedTreeImage(tree));
             assertEquals(2, tree.getRoot().getChildren().stream()
                     .mapToInt(category -> category.getChildren().size()).sum());
+            boards.selectFirst();
+            variants.selectItem(new MainWindow.FilterChoice("emmc"));
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("board-a")), boards.getItems());
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("Sipeed")), filter.getItems());
+            variants.selectFirst();
+            filter.selectItem(new MainWindow.FilterChoice("Sipeed"));
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("board-a")), boards.getItems());
+            assertEquals(List.of(new MainWindow.FilterChoice(null), new MainWindow.FilterChoice("emmc"),
+                    new MainWindow.FilterChoice("sd")), variants.getItems());
             return null;
         });
     }

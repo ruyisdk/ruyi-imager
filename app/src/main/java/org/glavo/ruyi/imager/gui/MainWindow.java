@@ -119,13 +119,12 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.Predicate;
-import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -982,7 +981,7 @@ public final class MainWindow {
 
     /// Builds a single-selection catalog filter with an unrestricted first option.
     private static MFXComboBox<FilterChoice> catalogFilter(String id, String labelKey, String allKey,
-            Stream<String> values, Function<String, String> displayName) {
+            Function<String, String> displayName) {
         MFXComboBox<FilterChoice> filter = new MFXComboBox<>();
         filter.setAllowEdit(false);
         filter.getSelectionModel().setAllowsMultipleSelection(false);
@@ -991,7 +990,6 @@ public final class MainWindow {
         filter.setPrefWidth(155);
         filter.setMaxWidth(155);
         filter.getItems().add(new FilterChoice(null));
-        filter.getItems().addAll(values.distinct().sorted().map(FilterChoice::new).toList());
         filter.setConverter(new StringConverter<>() {
             /// Displays the filter label without changing its metadata value.
             @Override
@@ -1028,6 +1026,20 @@ public final class MainWindow {
         return selected == null ? null : selected.value();
     }
 
+    /// Keeps the active constraint visible even when a search temporarily yields no matches.
+    private static void updateFilterOptions(MFXComboBox<FilterChoice> filter, Set<String> values, @Nullable String active) {
+        if (active != null) {
+            values.add(active);
+        }
+        var choices = new ArrayList<FilterChoice>();
+        choices.add(new FilterChoice(null));
+        values.forEach(value -> choices.add(new FilterChoice(value)));
+        if (!filter.getItems().equals(choices)) {
+            filter.getItems().setAll(choices);
+            filter.selectItem(new FilterChoice(active));
+        }
+    }
+
     /// Wraps the image tree with text search and optional hardware, supplier, variant, and writer filters.
     ///
     /// @param header header text.
@@ -1043,38 +1055,69 @@ public final class MainWindow {
             @Nullable ImageEntry currentImage, Consumer<@Nullable ImageEntry> onSelection) {
         TextField searchField = selectionSearchField();
         searchField.promptTextProperty().bind(Messages.binding("gui.catalog.search"));
-        @Unmodifiable List<ImageTarget> targets = images.stream().flatMap(image -> image.targets().stream())
-                .distinct().toList();
         var boardFilter = catalogFilter("image-board-filter", "gui.image.hardware", "gui.image.allHardware",
-                targets.stream().map(ImageTarget::board), MainWindow::boardDisplayName);
+                MainWindow::boardDisplayName);
         var supplierFilter = catalogFilter("image-supplier-filter", "gui.image.supplier", "gui.image.allSuppliers",
-                targets.stream().map(ImageTarget::manufacturer), ManufacturerNames::displayName);
+                ManufacturerNames::displayName);
         var variantFilter = catalogFilter("image-variant-filter", "gui.image.variant",
-                "gui.image.allVariants", targets.stream().map(ImageTarget::variant), Function.identity());
+                "gui.image.allVariants", Function.identity());
         CheckBox flashableOnly = new CheckBox();
         flashableOnly.getStyleClass().add("catalog-flashable-filter");
         flashableOnly.textProperty().bind(Messages.binding("gui.image.flashableOnly"));
-        FlowPane filters = new FlowPane(8, 6, boardFilter, supplierFilter, variantFilter, flashableOnly);
+        FlowPane filters = new FlowPane(8, 6, boardFilter, variantFilter, supplierFilter, flashableOnly);
         filters.setAlignment(Pos.CENTER_LEFT);
 
         BooleanProperty treeEmpty = new SimpleBooleanProperty();
         BooleanProperty rebuilding = new SimpleBooleanProperty();
         Consumer<@Nullable ImageEntry> refreshTree = selected -> {
+            if (rebuilding.get()) {
+                return;
+            }
             String query = normalizeSearchQuery(searchField.getText());
             @Nullable String board = filterValue(boardFilter);
             @Nullable String supplier = filterValue(supplierFilter);
             @Nullable String variant = filterValue(variantFilter);
-            Predicate<ImageTarget> matchesTarget = target ->
-                    target.matches(supplier, board) && (variant == null || variant.equals(target.variant()));
-            @Unmodifiable List<ImageEntry> filtered = images.stream()
-                    .filter(image -> !flashableOnly.isSelected() || catalogImageFlashable(image))
-                    .filter(image -> image.targets().stream().anyMatch(matchesTarget))
-                    .toList();
+            var boards = new TreeSet<String>();
+            var variants = new TreeSet<String>();
+            var suppliers = new TreeSet<String>();
+            var filtered = new ArrayList<ImageEntry>();
+            for (ImageEntry image : images) {
+                if (flashableOnly.isSelected() && !catalogImageFlashable(image)) {
+                    continue;
+                }
+                boolean matchesImage = query.isEmpty() || imageMatches(image, query);
+                boolean visible = false;
+                for (ImageTarget target : image.targets()) {
+                    if (!matchesImage && !imageTargetMatches(target, query)) {
+                        continue;
+                    }
+                    boolean boardMatches = board == null || board.equals(target.board());
+                    boolean variantMatches = variant == null || variant.equals(target.variant());
+                    boolean supplierMatches = supplier == null || supplier.equals(target.manufacturer());
+                    // Each menu ignores only its own constraint. Never combine associations from different targets.
+                    if (variantMatches && supplierMatches) {
+                        boards.add(target.board());
+                    }
+                    if (boardMatches && supplierMatches) {
+                        variants.add(target.variant());
+                    }
+                    if (boardMatches && variantMatches) {
+                        suppliers.add(target.manufacturer());
+                    }
+                    visible |= boardMatches && variantMatches && supplierMatches;
+                }
+                if (visible) {
+                    filtered.add(image);
+                }
+            }
             // Only the initial population restores the current image. Later refreshes keep whatever
             // the user selected, so filtering never brings back an image the filter hid.
             rebuilding.set(true);
             try {
-                populateOperatingSystemTree(treeView, filtered, query, matchesTarget, selected);
+                updateFilterOptions(boardFilter, boards, board);
+                updateFilterOptions(variantFilter, variants, variant);
+                updateFilterOptions(supplierFilter, suppliers, supplier);
+                populateOperatingSystemTree(treeView, filtered, selected);
             } finally {
                 rebuilding.set(false);
             }
@@ -1111,14 +1154,10 @@ public final class MainWindow {
     ///
     /// @param treeView operating system tree view.
     /// @param images source image entries.
-    /// @param query normalized search query.
-    /// @param matchesTarget limits target-specific search terms to the active filters.
     /// @param selectedImage image to select after rebuilding.
     private static void populateOperatingSystemTree(
             TreeView<OperatingSystemTreeNode> treeView,
             List<ImageEntry> images,
-            String query,
-            Predicate<ImageTarget> matchesTarget,
             @Nullable ImageEntry selectedImage) {
         TreeItem<OperatingSystemTreeNode> root = new TreeItem<>(
                 new OperatingSystemTreeNode("", null, 0));
@@ -1127,23 +1166,13 @@ public final class MainWindow {
         @Nullable TreeItem<OperatingSystemTreeNode> selectedItem = null;
         @Unmodifiable List<OperatingSystemCategoryOption> categories = operatingSystemCategoryOptions(images);
         for (OperatingSystemCategoryOption category : categories) {
-            boolean categoryMatches = textMatches(category.name(), query)
-                    || textMatches(Messages.get("gui.osCategory.item", category.name(), category.imageCount()), query);
-            ArrayList<ImageEntry> matchingImages = new ArrayList<>();
-            for (ImageEntry image : images) {
-                if (operatingSystemCategoryId(image).equals(category.id())
-                        && (query.isEmpty() || categoryMatches || imageMatches(image, query, matchesTarget))) {
-                    matchingImages.add(image);
-                }
-            }
-            if (matchingImages.isEmpty()) {
-                continue;
-            }
-
             TreeItem<OperatingSystemTreeNode> categoryItem = new TreeItem<>(
-                    new OperatingSystemTreeNode(category.name(), null, matchingImages.size()));
+                    new OperatingSystemTreeNode(category.name(), null, category.imageCount()));
             categoryItem.setExpanded(true);
-            for (ImageEntry image : matchingImages) {
+            for (ImageEntry image : images) {
+                if (!operatingSystemCategoryId(image).equals(category.id())) {
+                    continue;
+                }
                 TreeItem<OperatingSystemTreeNode> imageItem = new TreeItem<>(
                         new OperatingSystemTreeNode("", image, 0));
                 categoryItem.getChildren().add(imageItem);
@@ -3300,16 +3329,20 @@ public final class MainWindow {
     /// @param image image entry.
     /// @param query normalized query.
     /// @return whether the image matches.
-    private static boolean imageMatches(ImageEntry image, String query, Predicate<ImageTarget> matchesTarget) {
+    private static boolean imageMatches(ImageEntry image, String query) {
         return textMatches(image.displayName(), query)
                 || textMatches(operatingSystemCategoryName(image), query)
-                || image.targets().stream().filter(matchesTarget).anyMatch(target -> textMatches(target.manufacturer(), query)
-                        || textMatches(ManufacturerNames.displayName(target.manufacturer()), query)
-                        || textMatches(boardDisplayName(target.board()), query)
-                        || textMatches(target.variant(), query))
                 || textMatches(image.strategy(), query)
                 || textMatches(image.atom(), query)
                 || textMatches(imageSupportLabel(image), query);
+    }
+
+    /// Matches search terms that describe one specific hardware association.
+    private static boolean imageTargetMatches(ImageTarget target, String query) {
+        return textMatches(target.manufacturer(), query)
+                || textMatches(ManufacturerNames.displayName(target.manufacturer()), query)
+                || textMatches(boardDisplayName(target.board()), query)
+                || textMatches(target.variant(), query);
     }
 
     /// Returns whether a target device matches a search query.
