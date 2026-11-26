@@ -43,7 +43,6 @@ import javafx.scene.layout.Pane;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
-import javafx.scene.paint.LinearGradient;
 import javafx.scene.shape.Rectangle;
 import javafx.stage.Stage;
 import org.glavo.ruyi.imager.core.AppDirectories;
@@ -258,7 +257,7 @@ public final class MainWindowJavaFxSmokeTest {
                     Map.of("disk", "other.img"), List.of(), StrategySupport.SUPPORTED);
             TreeView<MainWindow.OperatingSystemTreeNode> tree = MainWindow.selectionTreeView();
             VBox content = (VBox) MainWindow.operatingSystemSelectionContent("Images", tree,
-                    List.of(shared, alternate, unassigned), shared);
+                    List.of(shared, alternate, unassigned), shared, _ -> {});
             Scene scene = new Scene(content);
             scene.getStylesheets().add(applicationStylesheet());
             content.applyCss();
@@ -313,7 +312,7 @@ public final class MainWindowJavaFxSmokeTest {
         runOnJavaFxThread(() -> {
             MainWindow window = new MainWindow(testServices(directory));
             try {
-                assertFalse(((Button) windowField(window, "osButton")).isDisabled());
+                assertFalse(((Node) windowField(window, "catalogSurface")).isDisabled());
                 var field = MainWindow.class.getDeclaredField("state");
                 field.setAccessible(true);
                 Class<?> stateClass = field.getType();
@@ -324,7 +323,7 @@ public final class MainWindowJavaFxSmokeTest {
                 var refresh = MainWindow.class.getDeclaredMethod("refreshState");
                 refresh.setAccessible(true);
                 refresh.invoke(window);
-                assertFalse(((Button) windowField(window, "osButton")).isDisabled());
+                assertFalse(((Node) windowField(window, "catalogSurface")).isDisabled());
                 var select = MainWindow.class.getDeclaredMethod("selectCatalogImage", ImageEntry.class);
                 select.setAccessible(true);
                 select.invoke(window, image("board-image", "Catalog image", "generic", "dd-v1", Map.of("disk", "disk.img")));
@@ -334,7 +333,7 @@ public final class MainWindowJavaFxSmokeTest {
                     getter.setAccessible(true);
                     assertNull(getter.invoke(state));
                 }
-                assertFalse(((Button) windowField(window, "osButton")).isDisabled());
+                assertFalse(((Node) windowField(window, "catalogSurface")).isDisabled());
                 assertFalse(((Button) windowField(window, "storageButton")).isDisabled());
                 assertTrue(((Button) windowField(window, "flashButton")).isDisabled());
             } finally {
@@ -408,6 +407,76 @@ public final class MainWindowJavaFxSmokeTest {
         });
     }
 
+    /// A slow or failed metadata fetch neither locks local-file selection nor discards the selected source.
+    @Test
+    public void localSourceSurvivesCatalogFailure(@TempDir Path directory) throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var finished = new CountDownLatch(1);
+        var base = testServices(directory);
+        new GuiPreferences(base.directories()).writeStartupSafetyWarningAccepted();
+        var repository = new RepositoryService() {
+            /// Simulates the first run without a cached checkout.
+            @Override
+            public boolean hasLocalMetadata() {
+                return false;
+            }
+
+            /// Allows the test to choose a file while the simulated fetch is pending.
+            @Override
+            public OperationResult update(ProgressReporter reporter) throws IOException {
+                entered.countDown();
+                try {
+                    if (!release.await(FX_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                        throw new IOException("Timed out waiting for test");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(e);
+                }
+                return OperationResult.failure("offline");
+            }
+        };
+        var services = new AppServices(base.directories(), repository, base.images(), base.devices(), base.fastboot(), base.flash());
+        MainWindow window = runOnJavaFxThread(() -> {
+            var result = new MainWindow(services);
+            result.showStartupActions();
+            var loading = (javafx.beans.property.ObjectProperty<?>) windowField(result, "catalogTask");
+            loading.addListener((_, _, task) -> {
+                if (task == null) finished.countDown();
+            });
+            return result;
+        });
+        try {
+            assertTrue(entered.await(FX_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            runOnJavaFxThread(() -> {
+                assertFalse(windowBusy(window).get());
+                assertFalse(((Button) windowField(window, "localImageButton")).isDisabled());
+                var raw = MainWindow.class.getDeclaredMethod("selectRawLocalImage", Path.class);
+                raw.setAccessible(true);
+                raw.invoke(window, directory.resolve("offline.img"));
+                return null;
+            });
+            release.countDown();
+            assertTrue(finished.await(FX_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            runOnJavaFxThread(() -> {
+                assertTrue(((Label) windowField(window, "osValue")).getText().contains("offline.img"));
+                assertFalse(((Button) windowField(window, "storageButton")).isDisabled());
+                new Scene(window.root(), 840, 560);
+                window.root().applyCss();
+                window.root().layout();
+                assertNotNull(window.root().lookup(".catalog-surface .header-button"));
+                return null;
+            });
+        } finally {
+            release.countDown();
+            runOnJavaFxThread(() -> {
+                window.shutdown();
+                return null;
+            });
+        }
+    }
+
     /// Verifies that the operating-system tree filters images and never treats a category as a selection.
     ///
     /// @throws Exception when JavaFX execution fails.
@@ -431,7 +500,7 @@ public final class MainWindowJavaFxSmokeTest {
                         Map.of("disk", "ubuntu.raw"));
 
                 TreeView<MainWindow.OperatingSystemTreeNode> treeView = MainWindow.selectionTreeView();
-                Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, List.of(revyos, ubuntu), revyos);
+                Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, List.of(revyos, ubuntu), revyos, _ -> {});
                 VBox contentBox = assertInstanceOf(VBox.class, content);
                 HBox headerRow = assertInstanceOf(HBox.class, contentBox.getChildren().get(0));
                 TextField searchField = assertInstanceOf(
@@ -530,7 +599,7 @@ public final class MainWindowJavaFxSmokeTest {
             BooleanBinding treeConfirm = MainWindow.selectionCanConfirm(treeView);
             assertFalse(treeConfirm.get());
 
-            MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null);
+            MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null, _ -> {});
             assertNull(treeView.getSelectionModel().getSelectedItem());
             assertFalse(treeConfirm.get());
 
@@ -656,42 +725,25 @@ public final class MainWindowJavaFxSmokeTest {
         });
     }
 
-    /// Verifies that a selection dialog asks for a choice until a confirmable item is selected.
-    ///
-    /// @throws Exception when JavaFX execution fails.
+    /// Rebuilding a filtered tree cannot activate a neighboring image or clear a still-visible selection.
     @Test
-    public void showsSelectionRequiredHintUntilAnItemIsChosen() throws Exception {
+    public void catalogFilterReportsOnlyEffectiveSelectionChanges() throws Exception {
         runOnJavaFxThread(() -> {
-            Locale originalLocale = Messages.locale();
-            Messages.setLocale(Locale.ENGLISH);
-            try {
-                TreeView<MainWindow.OperatingSystemTreeNode> treeView = MainWindow.selectionTreeView();
-                Node content = MainWindow.operatingSystemSelectionContent(
-                        "Choose OS",
-                        treeView,
-                        manyImages(),
-                        null);
-                VBox contentBox = assertInstanceOf(VBox.class, content);
-                assertEquals(4, contentBox.getChildren().size());
-                Label hint = assertInstanceOf(Label.class, contentBox.getChildren().get(3));
-                assertTrue(hint.isVisible());
-
-                TreeItem<MainWindow.OperatingSystemTreeNode> category = treeView.getRoot().getChildren().getFirst();
-                treeView.getSelectionModel().select(category.getChildren().getFirst());
-                assertFalse(hint.isVisible());
-
-                treeView.getSelectionModel().clearSelection();
-                assertTrue(hint.isVisible());
-
-                HBox headerRow = assertInstanceOf(HBox.class, contentBox.getChildren().get(0));
-                TextField searchField = assertInstanceOf(
-                        TextField.class,
-                        headerRow.getChildren().get(headerRow.getChildren().size() - 1));
-                searchField.setText("no-such-image");
-                assertFalse(hint.isVisible());
-            } finally {
-                Messages.setLocale(originalLocale);
-            }
+            var images = manyImages();
+            var tree = MainWindow.<MainWindow.OperatingSystemTreeNode>selectionTreeView();
+            var changes = new java.util.ArrayList<@Nullable ImageEntry>();
+            Node browser = MainWindow.operatingSystemSelectionContent("Catalog", tree, images, null, changes::add);
+            tree.getSelectionModel().select(tree.getRoot().getChildren().getFirst().getChildren().getFirst());
+            assertEquals(1, changes.size());
+            var selected = MainWindow.selectedTreeImage(tree);
+            TextField search = (TextField) browser.lookup(".selection-search");
+            search.setText("ubuntu");
+            assertSame(selected, MainWindow.selectedTreeImage(tree));
+            assertEquals(1, changes.size());
+            search.setText("no-such-board");
+            assertNull(MainWindow.selectedTreeImage(tree));
+            assertEquals(2, changes.size());
+            assertNull(changes.getLast());
             return null;
         });
     }
@@ -717,7 +769,7 @@ public final class MainWindowJavaFxSmokeTest {
                         "Choose OS",
                         treeView,
                         List.of(revyos),
-                        revyos);
+                        revyos, _ -> {});
                 VBox contentBox = assertInstanceOf(VBox.class, content);
 
                 HBox headerRow = assertInstanceOf(HBox.class, contentBox.getChildren().get(0));
@@ -775,9 +827,10 @@ public final class MainWindowJavaFxSmokeTest {
     public void showsOperatingSystemTreeScrollbar() throws Exception {
         runOnJavaFxThread(() -> {
             TreeView<MainWindow.OperatingSystemTreeNode> treeView = MainWindow.selectionTreeView();
-            Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null);
+            Node content = MainWindow.operatingSystemSelectionContent("Choose OS", treeView, manyImages(), null, _ -> {});
             Parent parent = assertInstanceOf(Parent.class, content);
-            Scene scene = new Scene(parent);
+            Scene scene = new Scene(parent, 800, 400);
+            parent.resize(800, 400);
             @Nullable String stylesheet = applicationStylesheet();
             assertNotNull(stylesheet);
             scene.getStylesheets().add(stylesheet);
@@ -851,9 +904,6 @@ public final class MainWindowJavaFxSmokeTest {
             parent.layout();
 
             Color primary = Color.web("#0a2c7e");
-            LinearGradient background = assertInstanceOf(LinearGradient.class, parent.getBackground().getFills().getFirst().getFill());
-            assertEquals(Color.web("#d9e0f3"), background.getStops().getFirst().getColor());
-            assertEquals(Color.web("#f5f5f7"), background.getStops().getLast().getColor());
             assertEquals(primary, action.getBackground().getFills().getFirst().getFill());
             assertEquals(Color.WHITE, action.getTextFill());
             assertEquals(Color.web("#f4eedb"), secondary.getBackground().getFills().getFirst().getFill());
@@ -1202,6 +1252,7 @@ public final class MainWindowJavaFxSmokeTest {
         runOnJavaFxThread(() -> {
             MainWindow window = new MainWindow(testServices(directory));
             try {
+                window.showHomeCatalog(new MainWindow.CatalogLoadResult(manyImages(), Map.of()));
                 Scene scene = new Scene(window.root(), width, width == 840 ? 560 : 700);
                 scene.getStylesheets().add(applicationStylesheet());
                 Label status = assertInstanceOf(Label.class, windowField(window, "statusLabel"));
@@ -1224,13 +1275,12 @@ public final class MainWindowJavaFxSmokeTest {
                 assertFalse(cancel.getParent().getParent().isVisible());
                 assertAbove(header, workflow);
                 assertAbove(workflow, footer);
-                Node localOption = window.root().lookup(".independent-option-row");
-                Node firstStep = window.root().lookup(".step-row");
-                assertEquals(firstStep.localToScene(firstStep.getLayoutBounds()).getMinY(),
-                        localOption.localToScene(localOption.getLayoutBounds()).getMinY(), 0.5);
-                Label badge = assertInstanceOf(Label.class, window.root().lookup(".step-badge"));
-                assertEquals(Color.WHITE, badge.getTextFill());
-                assertEquals(34, badge.getWidth(), 0.5);
+                Node catalog = window.root().lookup(".catalog-surface");
+                Node actions = window.root().lookup(".selection-summary");
+                assertAbove(catalog, actions);
+                assertTrue(catalog.getLayoutBounds().getWidth() > width * 0.85);
+                assertTrue(catalog.getLayoutBounds().getHeight() > scene.getHeight() * 0.45);
+                assertAbove(actions, footer);
                 String detail = "Writing https://example.invalid/" + "long-image-directory/".repeat(20) + "root.img";
                 status.setText(detail);
                 progress.setVisible(true);

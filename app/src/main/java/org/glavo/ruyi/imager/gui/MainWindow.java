@@ -12,6 +12,8 @@ import javafx.beans.Observable;
 import javafx.beans.binding.Bindings;
 import javafx.beans.binding.BooleanBinding;
 import javafx.beans.property.BooleanProperty;
+import javafx.beans.property.ObjectProperty;
+import javafx.beans.property.SimpleObjectProperty;
 import javafx.beans.property.ReadOnlyBooleanWrapper;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.value.ObservableBooleanValue;
@@ -44,6 +46,7 @@ import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.GridPane;
+import javafx.scene.layout.ColumnConstraints;
 import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
@@ -76,6 +79,7 @@ import org.glavo.ruyi.imager.core.fastboot.FastbootDevice;
 import org.glavo.ruyi.imager.core.flash.FlashRequest;
 import org.glavo.ruyi.imager.core.flash.FlashTarget;
 import org.glavo.ruyi.imager.core.image.ImageCacheStatus;
+import org.glavo.ruyi.imager.core.image.ImageCatalog;
 import org.glavo.ruyi.imager.core.image.ImageEntry;
 import org.glavo.ruyi.imager.core.image.ImageTarget;
 import org.glavo.ruyi.imager.core.image.LocalImageMatch;
@@ -188,10 +192,7 @@ public final class MainWindow {
     private static final String HEADER_LOGO_RESOURCE = "/ruyi-logo-128.png";
 
     /// Rendered logo size used in the application header.
-    private static final double HEADER_LOGO_SIZE = 58.0;
-
-    /// Fixed width used by the independent local-image option.
-    private static final double LOCAL_IMAGE_OPTION_WIDTH = 340.0;
+    private static final double HEADER_LOGO_SIZE = 36.0;
 
     /// Core services shared with the CLI.
     private final AppServices services;
@@ -245,8 +246,20 @@ public final class MainWindow {
     /// Operating system selection summary.
     private final Label osValue = new Label();
 
-    /// Local image selection summary.
-    private final Label localImageValue = new Label();
+    /// Holds the catalog or its inline loading and error state.
+    private final StackPane catalogSurface = new StackPane();
+
+    /// Current catalog browser, absent before the first successful load.
+    private @Nullable TreeView<OperatingSystemTreeNode> catalogTree;
+
+    /// Background catalog load, independent of foreground flash and local-file operations.
+    private final ObjectProperty<@Nullable Task<CatalogLoadResult>> catalogTask = new SimpleObjectProperty<>();
+
+    /// Snapshot displayed by the persistent catalog browser.
+    private @Nullable CatalogLoadResult displayedCatalog;
+
+    /// Last complete local snapshot for file matching during repository synchronization.
+    private volatile @Nullable ImageCatalog localCatalog;
 
     /// Storage selection summary.
     private final Label storageValue = new Label();
@@ -265,9 +278,6 @@ public final class MainWindow {
 
     /// Active flash target summary.
     private final Label activeTargetValue = new Label();
-
-    /// Operating system selection button.
-    private final Button osButton = localizedButton("gui.button.chooseOs");
 
     /// Catalog image download button shown next to the operating system selection button.
     private final Button downloadOsButton = localizedButton("gui.button.downloadOs");
@@ -366,6 +376,9 @@ public final class MainWindow {
                         ? downloadPausedMessage(downloadCurrentBytes, downloadTotalBytes)
                         : Messages.get("gui.status.ready"));
             }
+            if (displayedCatalog != null && catalogTask.get() == null && !closing) {
+                showHomeCatalog(displayedCatalog);
+            }
             refreshState();
         });
         statusLabel.setText(Messages.get("gui.status.ready"));
@@ -425,6 +438,9 @@ public final class MainWindow {
         }
         applicationUpdateSchedulingStarted = true;
         showStartupSafetyWarningIfNeeded();
+        if (!closing) {
+            loadHomeCatalog(CatalogRefresh.IF_STALE);
+        }
         if (!closing && updateChecker.current().applicationUpdatesEnabled()) {
             applicationUpdateTimer.setCycleCount(Animation.INDEFINITE);
             applicationUpdateTimer.play();
@@ -536,13 +552,6 @@ public final class MainWindow {
         Label title = localizedLabel("app.title");
         title.getStyleClass().add("app-title");
 
-        Label subtitle = localizedLabel("gui.header.subtitle");
-        subtitle.getStyleClass().add("app-subtitle");
-
-        VBox titleText = new VBox(2, title, subtitle);
-        titleText.setMinWidth(0);
-        titleText.getStyleClass().add("app-title-text");
-
         settingsButton.setOnAction(_ -> showSettings());
         settingsButton.getStyleClass().add("header-button");
         settingsButton.setMinWidth(Region.USE_PREF_SIZE);
@@ -550,7 +559,7 @@ public final class MainWindow {
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
-        HBox titleRow = new HBox(16, createHeaderLogo(), titleText, spacer, settingsButton);
+        HBox titleRow = new HBox(16, createHeaderLogo(), title, spacer, localImageButton, settingsButton);
         titleRow.setAlignment(Pos.CENTER_LEFT);
         titleRow.getStyleClass().add("app-header");
         return titleRow;
@@ -639,7 +648,6 @@ public final class MainWindow {
     ///
     /// @return workflow node.
     private VBox createWorkflow() {
-        osButton.setOnAction(_ -> chooseOperatingSystem());
         downloadOsButton.setOnAction(_ -> downloadSelectedImage());
 
         localImageButton.setOnAction(_ -> {
@@ -663,10 +671,8 @@ public final class MainWindow {
         localImageButton.getStyleClass().add("secondary-action-button");
         flashButton.getStyleClass().add("primary-action-button");
         cancelFlashButton.getStyleClass().add("cancel-flash-button");
-        targetTitle.getStyleClass().add("step-title");
-
-        HBox writeActions = new HBox(flashButton);
-        writeActions.getStyleClass().add("write-actions");
+        storageButton.getStyleClass().add("step-button");
+        downloadOsButton.getStyleClass().add("header-button");
 
         phaseProgressBox.getStyleClass().add("phase-progress-box");
         phaseProgressBox.setVisible(false);
@@ -674,53 +680,18 @@ public final class MainWindow {
         phaseProgressBox.setFillWidth(true);
         phaseProgressBox.setMaxWidth(Double.MAX_VALUE);
 
-        Label catalogTitle = localizedLabel("gui.choice.catalog");
-        catalogTitle.getStyleClass().add("choice-title");
-        catalogTitle.setAlignment(Pos.CENTER);
-        catalogTitle.setMaxWidth(Double.MAX_VALUE);
+        catalogSurface.getStyleClass().add("catalog-surface");
+        catalogSurface.setMinHeight(110);
+        VBox.setVgrow(catalogSurface, Priority.ALWAYS);
+        showCatalogNotice(Messages.get("gui.progress.loadingCatalog"), false);
 
-        HBox catalogStep = createStep("1", "gui.step.os", osValue, osButton, downloadOsButton);
-        VBox.setVgrow(catalogStep, Priority.ALWAYS);
-        VBox catalogFlow = new VBox(12, catalogTitle, catalogStep);
-        catalogFlow.getStyleClass().add("catalog-choice");
-        catalogFlow.setMaxWidth(Double.MAX_VALUE);
-        HBox.setHgrow(catalogFlow, Priority.ALWAYS);
-
-        Label localTitle = localizedLabel("gui.choice.local");
-        localTitle.getStyleClass().add("choice-title");
-        localTitle.setAlignment(Pos.CENTER);
-        localTitle.setMaxWidth(Double.MAX_VALUE);
-
-        VBox localOption = createLocalImageOption();
-        VBox.setVgrow(localOption, Priority.ALWAYS);
-
-        VBox localFlow = new VBox(12, localTitle, localOption);
-        localFlow.setAlignment(Pos.TOP_RIGHT);
-        localFlow.setMinWidth(LOCAL_IMAGE_OPTION_WIDTH);
-        localFlow.setPrefWidth(LOCAL_IMAGE_OPTION_WIDTH);
-        localFlow.setMaxWidth(LOCAL_IMAGE_OPTION_WIDTH);
-        localFlow.getStyleClass().add("local-choice");
-        HBox.setHgrow(localFlow, Priority.NEVER);
-
-        Label separator = localizedLabel("gui.choice.or");
-        separator.getStyleClass().add("choice-separator");
-        Region separatorTitleSpacer = new Region();
-        separatorTitleSpacer.prefHeightProperty().bind(catalogTitle.heightProperty());
-        VBox separatorBox = new VBox(separator);
-        separatorBox.setAlignment(Pos.CENTER);
-        VBox.setVgrow(separatorBox, Priority.ALWAYS);
-        VBox separatorFlow = new VBox(12, separatorTitleSpacer, separatorBox);
-        separatorFlow.setAlignment(Pos.TOP_CENTER);
-
-        HBox sourceChoices = new HBox(16, catalogFlow, separatorFlow, localFlow);
-        sourceChoices.setAlignment(Pos.TOP_CENTER);
-        sourceChoices.setMaxWidth(Double.MAX_VALUE);
-        sourceChoices.getStyleClass().add("source-choices");
-
-        selectionControlsBox.getChildren().setAll(
-                sourceChoices,
-                createStep("2", targetTitle, storageValue, storageButton),
-                writeActions);
+        VBox source = summaryField(localizedLabel("gui.step.os"), osValue);
+        VBox target = summaryField(targetTitle, storageValue);
+        HBox actions = new HBox(12, source, downloadOsButton, target, storageButton, flashButton);
+        actions.setAlignment(Pos.CENTER_LEFT);
+        actions.getStyleClass().add("selection-summary");
+        selectionControlsBox.getChildren().setAll(catalogSurface, actions);
+        VBox.setVgrow(selectionControlsBox, Priority.ALWAYS);
         selectionControlsBox.getStyleClass().add("selection-controls-box");
         selectionControlsBox.setFillWidth(true);
         selectionControlsBox.setMaxWidth(Double.MAX_VALUE);
@@ -783,65 +754,18 @@ public final class MainWindow {
         GridPane.setFillWidth(value, true);
     }
 
-    /// Creates the independent local-image option outside the catalog selection flow.
-    ///
-    /// @return custom image option node.
-    private VBox createLocalImageOption() {
-        localImageValue.getStyleClass().add("option-value");
-        localImageValue.setAlignment(Pos.CENTER);
-        localImageValue.setMaxWidth(Double.MAX_VALUE);
-        localImageValue.setWrapText(true);
-
-        VBox row = new VBox(8, localImageValue, localImageButton);
-        row.setAlignment(Pos.CENTER);
-        row.setPrefWidth(LOCAL_IMAGE_OPTION_WIDTH);
-        row.setMaxWidth(LOCAL_IMAGE_OPTION_WIDTH);
-        row.getStyleClass().add("independent-option-row");
-
-        return row;
-    }
-
-    /// Creates one workflow row.
-    ///
-    /// @param number step number.
-    /// @param titleKey step title key.
-    /// @param value current step value.
-    /// @param actions action buttons.
-    /// @return workflow row.
-    private HBox createStep(String number, String titleKey, Label value, Node... actions) {
-        Label titleLabel = localizedLabel(titleKey);
-        return createStep(number, titleLabel, value, actions);
-    }
-
-    /// Creates one workflow row.
-    ///
-    /// @param number step number.
-    /// @param titleLabel step title label.
-    /// @param value current step value.
-    /// @param actions action buttons.
-    /// @return workflow row.
-    private HBox createStep(String number, Label titleLabel, Label value, Node... actions) {
-        Label badge = new Label(number);
-        badge.getStyleClass().add("step-badge");
-
-        titleLabel.getStyleClass().add("step-title");
-        value.getStyleClass().add("step-value");
-        VBox text = new VBox(4, titleLabel, value);
-        text.setMinWidth(0);
-        HBox.setHgrow(text, Priority.ALWAYS);
-
-        for (Node action : actions) {
-            if (action instanceof Button button) {
-                button.getStyleClass().add("step-button");
-                button.setMinWidth(Region.USE_PREF_SIZE);
-            }
-        }
-        HBox actionBox = new HBox(8, actions);
-        actionBox.setAlignment(Pos.CENTER_LEFT);
-        HBox row = new HBox(16, badge, text, actionBox);
-        row.setAlignment(Pos.CENTER_LEFT);
-        row.getStyleClass().add("step-row");
-        return row;
+    /// Builds one flexible summary column; full values remain available when the window is narrow.
+    private static VBox summaryField(Label title, Label value) {
+        title.getStyleClass().add("summary-caption");
+        value.getStyleClass().add("summary-value");
+        Tooltip tooltip = new Tooltip();
+        tooltip.textProperty().bind(value.textProperty());
+        value.setTooltip(tooltip);
+        VBox column = new VBox(3, title, value);
+        column.setMinWidth(0);
+        column.setPrefWidth(160);
+        HBox.setHgrow(column, Priority.ALWAYS);
+        return column;
     }
 
     /// Creates a label bound to a localized message.
@@ -887,9 +811,9 @@ public final class MainWindow {
         treeView.getStyleClass().add("selection-tree-view");
         treeView.setEffect(null);
         treeView.setShowRoot(false);
-        treeView.setMinSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
+        treeView.setMinSize(0, 80);
         treeView.setPrefSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
-        treeView.setMaxSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
+        treeView.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
         return treeView;
     }
 
@@ -1012,9 +936,10 @@ public final class MainWindow {
         message.visibleProperty().bind(empty);
 
         StackPane area = new StackPane(selectionView, message);
-        area.setMinSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
+        boolean expandable = selectionView instanceof TreeView<?>;
+        area.setMinSize(expandable ? 0 : SELECTION_LIST_WIDTH, expandable ? 80 : SELECTION_LIST_HEIGHT);
         area.setPrefSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
-        area.setMaxSize(SELECTION_LIST_WIDTH, SELECTION_LIST_HEIGHT);
+        area.setMaxSize(expandable ? Double.MAX_VALUE : SELECTION_LIST_WIDTH, expandable ? Double.MAX_VALUE : SELECTION_LIST_HEIGHT);
         return area;
     }
 
@@ -1109,13 +1034,15 @@ public final class MainWindow {
     /// @param treeView operating system tree view.
     /// @param images source image entries.
     /// @param currentImage currently selected image.
+    /// @param onSelection receives user selection changes, including a selection hidden by a filter.
     /// @return operating system selection content.
     static Node operatingSystemSelectionContent(
             String header,
             TreeView<OperatingSystemTreeNode> treeView,
             List<ImageEntry> images,
-            @Nullable ImageEntry currentImage) {
+            @Nullable ImageEntry currentImage, Consumer<@Nullable ImageEntry> onSelection) {
         TextField searchField = selectionSearchField();
+        searchField.promptTextProperty().bind(Messages.binding("gui.catalog.search"));
         @Unmodifiable List<ImageTarget> targets = images.stream().flatMap(image -> image.targets().stream())
                 .distinct().toList();
         var boardFilter = catalogFilter("image-board-filter", "gui.image.hardware", "gui.image.allHardware",
@@ -1124,11 +1051,14 @@ public final class MainWindow {
                 targets.stream().map(ImageTarget::manufacturer), ManufacturerNames::displayName);
         var variantFilter = catalogFilter("image-variant-filter", "gui.image.variant",
                 "gui.image.allVariants", targets.stream().map(ImageTarget::variant), Function.identity());
-        CheckBox flashableOnly = new CheckBox(Messages.get("gui.image.flashableOnly"));
+        CheckBox flashableOnly = new CheckBox();
+        flashableOnly.getStyleClass().add("catalog-flashable-filter");
+        flashableOnly.textProperty().bind(Messages.binding("gui.image.flashableOnly"));
         FlowPane filters = new FlowPane(8, 6, boardFilter, supplierFilter, variantFilter, flashableOnly);
         filters.setAlignment(Pos.CENTER_LEFT);
 
         BooleanProperty treeEmpty = new SimpleBooleanProperty();
+        BooleanProperty rebuilding = new SimpleBooleanProperty();
         Consumer<@Nullable ImageEntry> refreshTree = selected -> {
             String query = normalizeSearchQuery(searchField.getText());
             @Nullable String board = filterValue(boardFilter);
@@ -1142,7 +1072,15 @@ public final class MainWindow {
                     .toList();
             // Only the initial population restores the current image. Later refreshes keep whatever
             // the user selected, so filtering never brings back an image the filter hid.
-            populateOperatingSystemTree(treeView, filtered, query, matchesTarget, selected);
+            rebuilding.set(true);
+            try {
+                populateOperatingSystemTree(treeView, filtered, query, matchesTarget, selected);
+            } finally {
+                rebuilding.set(false);
+            }
+            if (selected != null && selectedTreeImage(treeView) == null) {
+                onSelection.accept(null);
+            }
             treeEmpty.set(treeView.getRoot() == null || treeView.getRoot().getChildren().isEmpty());
         };
 
@@ -1153,16 +1091,19 @@ public final class MainWindow {
         variantFilter.getSelectionModel().selection().addListener(changed);
         flashableOnly.selectedProperty().addListener(changed);
         refreshTree.accept(currentImage);
+        treeView.getSelectionModel().selectedItemProperty().addListener((_, before, after) -> {
+            if (!rebuilding.get() && (before != null && before.getValue().image() != null
+                    || after != null && after.getValue().image() != null)) {
+                onSelection.accept(selectedTreeImage(treeView));
+            }
+        });
 
         StackPane treeArea = selectionEmptyState(treeView, treeEmpty);
-        Label selectHint = selectionRequiredHint(selectionCanConfirm(treeView).not(), treeEmpty);
-        VBox content = new VBox(10, selectionHeaderRow(header, searchField), filters, treeArea, selectHint);
-        content.setMinWidth(SELECTION_LIST_WIDTH);
-        content.setPrefWidth(SELECTION_LIST_WIDTH);
-        content.setMaxWidth(SELECTION_LIST_WIDTH);
-        content.setPadding(new Insets(0.0, 0.0, SELECTION_CONTENT_BOTTOM_INSET, 0.0));
-        content.getStyleClass().add("selection-content");
-        VBox.setVgrow(treeArea, Priority.NEVER);
+        HBox heading = selectionHeaderRow(header, searchField);
+        heading.setMinWidth(0);
+        heading.setMaxWidth(Double.MAX_VALUE);
+        VBox content = new VBox(8, heading, filters, treeArea);
+        VBox.setVgrow(treeArea, Priority.ALWAYS);
         return content;
     }
 
@@ -1285,6 +1226,8 @@ public final class MainWindow {
         if (updateChecker.current().applicationUpdatesEnabled()) {
             settings.applicationUpdateButton().setOnAction(_ -> checkApplicationUpdate(settings));
         }
+        Parent metadataActions = settings.metadataUpdateButton().getParent();
+        metadataActions.disableProperty().bind(catalogTask.isNotNull());
         settings.metadataUpdateButton().setOnAction(_ -> updateRepository(settings));
         boolean accepted;
         try {
@@ -1297,6 +1240,7 @@ public final class MainWindow {
                     null,
                     null);
         } finally {
+            metadataActions.disableProperty().unbind();
             settings.root().disableProperty().unbind();
         }
         if (!accepted) {
@@ -1484,12 +1428,13 @@ public final class MainWindow {
                 state = new WizardState(null, null, null);
                 refreshState();
             }
+            loadHomeCatalog(CatalogRefresh.CACHE_ONLY);
             settings.metadataUpdateFinished(result.success(), result.message());
-        }, failure -> settings.metadataUpdateFinished(
-                false,
-                failure == null || failure.getMessage() == null
-                        ? Messages.get("gui.dialog.metadataUpdateFailed")
-                        : failure.getMessage()));
+        }, failure -> {
+            loadHomeCatalog(CatalogRefresh.CACHE_ONLY);
+            settings.metadataUpdateFinished(false, failure == null || failure.getMessage() == null
+                    ? Messages.get("gui.dialog.metadataUpdateFailed") : failure.getMessage());
+        });
     }
 
     /// Records a successful metadata update without failing the completed update.
@@ -1524,18 +1469,31 @@ public final class MainWindow {
                 || Duration.between(updatedAt, now).compareTo(METADATA_AUTO_UPDATE_INTERVAL) >= 0;
     }
 
-    /// Loads or refreshes metadata before opening the image catalog.
-    private void chooseOperatingSystem() {
-        @Nullable ImageEntry previousImage = state.image();
+    /// Repository policy for opening, retrying, or reloading the homepage catalog.
+    @NotNullByDefault
+    private enum CatalogRefresh {
+        IF_STALE, FORCE, CACHE_ONLY
+    }
+
+    /// Loads the homepage independently of foreground work.
+    private void loadHomeCatalog(CatalogRefresh refresh) {
+        if (closing || catalogTask.get() != null) {
+            return;
+        }
         Task<CatalogLoadResult> task = new Task<>() {
             /// Loads the image catalog outside the JavaFX application thread.
             ///
             /// @return catalog load result.
             @Override
             protected CatalogLoadResult call() throws Exception {
-                boolean metadataUpdated = false;
                 boolean hasLocalMetadata = services.repository().hasLocalMetadata();
-                if (!hasLocalMetadata || automaticMetadataUpdateDue()) {
+                if (refresh == CatalogRefresh.FORCE || refresh == CatalogRefresh.IF_STALE && (!hasLocalMetadata || automaticMetadataUpdateDue())) {
+                    // File identification must not read a checkout while the updater is modifying it.
+                    try {
+                        localCatalog = services.images().listImages();
+                    } catch (IOException exception) {
+                        LOGGER.warn("Could not read the existing catalog before refreshing metadata.", exception);
+                    }
                     LOGGER.atInfo().log(() -> hasLocalMetadata
                             ? "Local repository metadata is stale; updating before image selection."
                             : "Local repository metadata is missing; updating before image selection.");
@@ -1551,7 +1509,6 @@ public final class MainWindow {
                         }, LOGGER));
                         if (result.success()) {
                             recordMetadataUpdateSuccess();
-                            metadataUpdated = true;
                         } else if (!hasLocalMetadata) {
                             throw new IOException(result.message());
                         } else {
@@ -1569,33 +1526,76 @@ public final class MainWindow {
                 updateMessage(Messages.get("gui.progress.loadingCatalog"));
                 var catalog = services.images().listImages();
                 var images = catalog.browsableImages();
-                boolean selectionRemoved = metadataUpdated && previousImage != null && !catalog.images().contains(previousImage);
-                return new CatalogLoadResult(images, imageCacheStatuses(images), selectionRemoved);
+                localCatalog = catalog;
+                return new CatalogLoadResult(images, imageCacheStatuses(images));
             }
         };
 
-        startBackgroundTask(task, Messages.get("gui.dialog.imageError"), result -> {
-            if (result.selectionRemoved()) {
-                state = new WizardState(null, null, null);
-                refreshState();
+        displayedCatalog = null;
+        catalogTree = null;
+        catalogTask.set(task);
+        Label loading = new Label(Messages.get("gui.progress.loadingCatalog"));
+        task.messageProperty().addListener((_, _, message) -> loading.setText(message));
+        loading.setWrapText(true);
+        catalogSurface.getChildren().setAll(loading);
+        task.setOnSucceeded(_ -> {
+            if (catalogTask.get() == task) {
+                catalogTask.set(null);
+                showHomeCatalog(task.getValue());
             }
-            showOperatingSystemDialog(result);
         });
+        task.setOnFailed(_ -> {
+            if (catalogTask.get() == task) {
+                catalogTask.set(null);
+                Throwable failure = task.getException();
+                LOGGER.warn("Could not load the homepage catalog.", failure);
+                showCatalogNotice(Messages.get("gui.dialog.imageError") + ": " + failure.getLocalizedMessage(), true);
+            }
+        });
+        Thread.ofPlatform().daemon().name("ruyi-home-catalog").start(task);
     }
 
-    /// Shows the operating system selection dialog.
+    /// Displays catalog errors and empty states without interrupting local-file work.
+    private void showCatalogNotice(String message, boolean canRetry) {
+        Label label = new Label(message);
+        label.setWrapText(true);
+        label.setMaxWidth(520);
+        VBox notice = new VBox(10, label);
+        notice.setAlignment(Pos.CENTER);
+        if (canRetry) {
+            Button retry = localizedButton("gui.catalog.retry");
+            retry.getStyleClass().add("header-button");
+            retry.setOnAction(_ -> loadHomeCatalog(CatalogRefresh.FORCE));
+            notice.getChildren().add(retry);
+        }
+        catalogSurface.getChildren().setAll(notice);
+    }
+
+    /// Installs the browsable image snapshot in the main window.
     ///
     /// @param catalog image entries and cache statuses loaded off the UI thread.
-    private void showOperatingSystemDialog(CatalogLoadResult catalog) {
+    void showHomeCatalog(CatalogLoadResult catalog) {
+        displayedCatalog = catalog;
         var images = catalog.images();
         if (images.isEmpty()) {
-            showInfo(Messages.get("gui.dialog.noOperatingSystems"), Messages.get("gui.image.empty"));
+            catalogTree = null;
+            showCatalogNotice(Messages.get("gui.image.empty"), true);
             return;
         }
 
         TreeView<OperatingSystemTreeNode> treeView = selectionTreeView();
         String header = Messages.get("gui.dialog.chooseOperatingSystem.header");
-        Node content = operatingSystemSelectionContent(header, treeView, images, state.image());
+        catalogTree = treeView;
+        Node content = operatingSystemSelectionContent(header, treeView, images,
+                state.image() != null && images.contains(state.image()) ? state.image() : null,
+                selected -> {
+                    if (selected != null) {
+                        selectCatalogImage(selected);
+                    } else {
+                        state = new WizardState(null, null, null);
+                        refreshState();
+                    }
+                });
         treeView.setCellFactory(_ -> new TreeCell<>() {
             /// Updates one operating system tree cell.
             ///
@@ -1618,7 +1618,11 @@ public final class MainWindow {
                     getStyleClass().add("os-category-tree-cell");
                 } else {
                     setText(null);
-                    setGraphic(imageCellContent(image, cacheStatus(catalog.cacheStatuses(), image)));
+                    GridPane row = imageCellContent(image,
+                            cacheStatus(displayedCatalog == null ? Map.of() : displayedCatalog.cacheStatuses(), image));
+                    // Reserve space for tree indentation, cell padding, and the scrollbar.
+                    row.prefWidthProperty().bind(treeView.widthProperty().subtract(86));
+                    setGraphic(row);
                     getStyleClass().add(catalogImageFlashable(image)
                             ? "flashable-image-cell"
                             : "unsupported-image-cell");
@@ -1626,12 +1630,7 @@ public final class MainWindow {
             }
         });
 
-        if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseOperatingSystem"), content, treeView, selectionCanConfirm(treeView))) {
-            @Nullable ImageEntry selected = selectedTreeImage(treeView);
-            if (selected != null) {
-                selectCatalogImage(selected);
-            }
-        }
+        catalogSurface.getChildren().setAll(content);
     }
 
     /// Changing the image requires an explicit physical device selection.
@@ -1676,7 +1675,8 @@ public final class MainWindow {
             @Override
             protected List<LocalImageMatch> call() throws Exception {
                 updateMessage(Messages.get("gui.local.identifying"));
-                return LocalImageMatcher.match(source, services.images().listImages(), event -> {
+                @Nullable ImageCatalog snapshot = localCatalog;
+                return LocalImageMatcher.match(source, snapshot != null ? snapshot : services.images().listImages(), event -> {
                     updateMessage(event.message());
                     updateProgress(event.currentBytes() == null ? 0 : event.currentBytes(),
                             event.totalBytes() == null || event.totalBytes() <= 0 ? -1 : event.totalBytes());
@@ -1730,6 +1730,9 @@ public final class MainWindow {
 
     /// Stores an explicitly requested raw write and clears any previously selected device.
     private void selectRawLocalImage(Path source) {
+        if (catalogTree != null) {
+            catalogTree.getSelectionModel().clearSelection();
+        }
         state = new WizardState(null, source, null);
         refreshState();
     }
@@ -1759,7 +1762,11 @@ public final class MainWindow {
 
     /// Activates a prepared image and requires a fresh physical device selection.
     private void selectPreparedLocalImage(ImageEntry image) {
+        if (catalogTree != null) {
+            catalogTree.getSelectionModel().clearSelection();
+        }
         state = new WizardState(image, null, null);
+        refreshCatalogCacheStatus(image);
         refreshState();
     }
 
@@ -2449,6 +2456,11 @@ public final class MainWindow {
     /// This method must be called on the JavaFX application thread.
     public void shutdown() {
         closing = true;
+        @Nullable Task<CatalogLoadResult> loading = catalogTask.get();
+        if (loading != null) {
+            catalogTask.set(null);
+            loading.cancel(true);
+        }
         applicationUpdateTimer.stop();
         @Nullable Thread thread = currentBackgroundThread;
         if (!flashInProgress || thread == null || !thread.isAlive()) {
@@ -2536,6 +2548,7 @@ public final class MainWindow {
         flashInProgress = false;
         cancellationRequested = false;
         if (finishedDownload) {
+            refreshCatalogCacheStatus(downloadImage);
             downloadInProgress = false;
             downloadPauseRequested = false;
             downloadPaused = false;
@@ -2726,8 +2739,8 @@ public final class MainWindow {
 
     /// Refreshes labels and enabled states from the current selections.
     private void refreshState() {
-        osValue.setText(osLabel());
-        localImageValue.setText(localImageLabel());
+        osValue.setText(state.image() != null ? state.image().displayName() + " " + state.image().version()
+                : state.localImage() != null ? localImageLabel() : Messages.get("gui.value.os.none"));
         boolean fastbootTarget = requiresFastbootTarget();
         targetTitle.setText(Messages.get(fastbootTarget ? "gui.step.fastboot" : "gui.step.storage"));
         storageButton.setText(Messages.get(fastbootTarget ? "gui.button.chooseFastboot" : "gui.button.chooseStorage"));
@@ -2740,7 +2753,7 @@ public final class MainWindow {
         activeFlashBox.setVisible(showActiveFlashBox);
         activeFlashBox.setManaged(showActiveFlashBox);
         settingsButton.setDisable(busy.get());
-        osButton.setDisable(busy.get());
+        catalogSurface.setDisable(busy.get());
         @Nullable ImageEntry selectedImage = state.image();
         downloadOsButton.setDisable(busy.get()
                 || state.localImage() != null
@@ -3056,18 +3069,6 @@ public final class MainWindow {
         return board.startsWith("cpu:") ? Messages.get("gui.value.board.processor", board.substring(4)) : board;
     }
 
-    /// Formats the operating system catalog step label.
-    ///
-    /// @return operating system step label.
-    private String osLabel() {
-        if (state.localImage() != null) {
-            return Messages.get("gui.value.skippedLocal");
-        }
-
-        @Nullable ImageEntry image = state.image();
-        return image == null ? Messages.get("gui.value.os.none") : imageLabel(image, imageCacheStatus(image));
-    }
-
     /// Formats the selected local image option.
     ///
     /// @return local image option label.
@@ -3345,6 +3346,17 @@ public final class MainWindow {
         return text != null && text.toLowerCase(Locale.ROOT).contains(query);
     }
 
+    /// Refreshes the affected row after a download or import without resetting catalog filters.
+    private void refreshCatalogCacheStatus(@Nullable ImageEntry image) {
+        if (image == null || displayedCatalog == null || catalogTree == null) {
+            return;
+        }
+        var statuses = new LinkedHashMap<>(displayedCatalog.cacheStatuses());
+        statuses.put(image.atom(), imageCacheStatus(image));
+        displayedCatalog = new CatalogLoadResult(displayedCatalog.images(), Map.copyOf(statuses));
+        catalogTree.refresh();
+    }
+
     /// Reads cache statuses for a list of images.
     ///
     /// @param images image entries.
@@ -3407,31 +3419,38 @@ public final class MainWindow {
     /// @param image image entry.
     /// @param cacheStatus image cache status.
     /// @return cell content.
-    private Node imageCellContent(ImageEntry image, ImageCacheStatus cacheStatus) {
-        Label title = new Label(image.displayName());
+    private static GridPane imageCellContent(ImageEntry image, ImageCacheStatus cacheStatus) {
+        GridPane row = new GridPane();
+        row.setAlignment(Pos.CENTER_LEFT);
+        row.setHgap(12);
+        for (int share : new int[]{49, 30, 21}) {
+            ColumnConstraints column = new ColumnConstraints();
+            column.setPercentWidth(share);
+            row.getColumnConstraints().add(column);
+        }
+        row.add(catalogCellText(image.displayName(), image.atom()), 0, 0);
+        row.add(catalogCellText(imageHardware(image), imageSuppliers(image)), 1, 0);
+        Label support = statusPill(imageSupportLabel(image),
+                catalogImageFlashable(image) ? "status-supported" : "status-blocked");
+        Label cache = statusPill(imageCacheStatusLabel(cacheStatus), imageCacheStatusStyle(cacheStatus));
+        VBox status = new VBox(3, support, cache);
+        status.setAlignment(Pos.CENTER_RIGHT);
+        row.add(status, 2, 0);
+        row.setMouseTransparent(true);
+        return row;
+    }
+
+    /// Pairs a scannable image attribute with its secondary identifier.
+    private static VBox catalogCellText(String value, String detail) {
+        Label title = new Label(value);
         title.setWrapText(true);
         title.getStyleClass().add("selection-title");
-
-        Label details = new Label(Messages.get(
-                "gui.image.details",
-                imageHardware(image),
-                image.strategy(),
-                image.atom(),
-                imageSuppliers(image)));
-        details.setWrapText(true);
-        details.getStyleClass().add("selection-detail");
-
-        Label supportStatus = statusPill(
-                imageSupportLabel(image),
-                catalogImageFlashable(image) ? "status-supported" : "status-blocked");
-        Label cacheStatusLabel = statusPill(imageCacheStatusLabel(cacheStatus), imageCacheStatusStyle(cacheStatus));
-        HBox statusRow = new HBox(6, supportStatus, cacheStatusLabel);
-        statusRow.getStyleClass().add("selection-pill-row");
-
-        VBox content = new VBox(4, title, details, statusRow);
-        content.getStyleClass().add("selection-cell-content");
-        content.setMouseTransparent(true);
-        return content;
+        Label secondary = new Label(detail);
+        secondary.setWrapText(true);
+        secondary.getStyleClass().add("selection-detail");
+        VBox text = new VBox(3, title, secondary);
+        text.setMinWidth(0);
+        return text;
     }
 
     /// Creates rich content for one target list cell.
@@ -4184,10 +4203,9 @@ public final class MainWindow {
     ///
     /// @param images browsable catalog entries.
     /// @param cacheStatuses cache statuses keyed by image atom.
-    /// @param selectionRemoved whether the selected catalog entry disappeared or changed during a refresh.
     @NotNullByDefault
-    private record CatalogLoadResult(@Unmodifiable List<ImageEntry> images,
-                                     @Unmodifiable Map<String, ImageCacheStatus> cacheStatuses, boolean selectionRemoved) {
+    record CatalogLoadResult(@Unmodifiable List<ImageEntry> images,
+                                     @Unmodifiable Map<String, ImageCacheStatus> cacheStatuses) {
     }
 
     /// Holds the current guided workflow selections.
