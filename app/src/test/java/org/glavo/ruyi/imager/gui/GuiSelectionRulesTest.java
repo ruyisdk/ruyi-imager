@@ -5,7 +5,6 @@ package org.glavo.ruyi.imager.gui;
 
 import org.glavo.ruyi.imager.core.StrategySupport;
 import org.glavo.ruyi.imager.core.device.BlockDevice;
-import org.glavo.ruyi.imager.core.fastboot.FastbootDevice;
 import org.glavo.ruyi.imager.core.flash.FlashTarget;
 import org.glavo.ruyi.imager.core.image.ImageEntry;
 import org.jetbrains.annotations.NotNullByDefault;
@@ -18,8 +17,6 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Tests for JavaFX-independent GUI selection rules.
@@ -45,35 +42,6 @@ public final class GuiSelectionRulesTest {
                 "dd-v1",
                 Map.of("disk", "image.raw"),
                 StrategySupport.UNKNOWN)));
-    }
-
-    /// Verifies target mode compatibility when the selected image source changes.
-    @Test
-    public void keepsOnlyCompatibleTargetModes() {
-        BlockDevice disk = device("disk", Path.of("disk.raw"), false, false, false);
-        BlockDevice boot = device("boot", Path.of("boot.raw"), false, false, false);
-        BlockDevice root = device("root", Path.of("root.raw"), false, false, false);
-        FlashTarget blockTarget = FlashTarget.blockDevice(disk);
-        FlashTarget partitionTarget = FlashTarget.blockDevices(Map.of("boot", boot, "root", root));
-        FlashTarget fastbootTarget = FlashTarget.fastbootDevice(new FastbootDevice("fb", "fb", "fastboot"));
-        ImageEntry singleDd = image("dd-v1", Map.of("disk", "image.raw"));
-        ImageEntry partitionDd = image("dd-v1", Map.of("boot", "boot.img", "root", "root.img"));
-        ImageEntry fastboot = image("fastboot-v1", Map.of("boot", "boot.img"));
-        ImageEntry spacemit = image("spacemit-k1-v1", Map.of("fsbl", "FSBL.bin", "uboot", "u-boot.itb"));
-        ImageEntry k3 = image("spacemit-k3-v1", Map.of("fsbl", "FSBL.bin", "uboot", "u-boot.itb"));
-
-        assertSame(blockTarget, GuiSelectionRules.compatibleTarget(blockTarget, null, Path.of("local.raw")));
-        assertNull(GuiSelectionRules.compatibleTarget(fastbootTarget, null, Path.of("local.raw")));
-        assertSame(blockTarget, GuiSelectionRules.compatibleTarget(blockTarget, singleDd, null));
-        assertNull(GuiSelectionRules.compatibleTarget(partitionTarget, singleDd, null));
-        assertSame(partitionTarget, GuiSelectionRules.compatibleTarget(partitionTarget, partitionDd, null));
-        assertNull(GuiSelectionRules.compatibleTarget(blockTarget, partitionDd, null));
-        assertSame(fastbootTarget, GuiSelectionRules.compatibleTarget(fastbootTarget, fastboot, null));
-        assertNull(GuiSelectionRules.compatibleTarget(blockTarget, fastboot, null));
-        assertSame(fastbootTarget, GuiSelectionRules.compatibleTarget(fastbootTarget, spacemit, null));
-        assertNull(GuiSelectionRules.compatibleTarget(blockTarget, spacemit, null));
-        assertSame(fastbootTarget, GuiSelectionRules.compatibleTarget(fastbootTarget, k3, null));
-        assertNull(GuiSelectionRules.compatibleTarget(blockTarget, k3, null));
     }
 
     /// Verifies multi-partition target completeness, uniqueness, and safety checks.

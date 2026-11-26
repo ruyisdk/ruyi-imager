@@ -67,31 +67,6 @@ final class GuiSelectionRules {
                 && target.blockDevices().keySet().equals(image.partitionMap().keySet());
     }
 
-    /// Keeps a target only when it matches the selected image source.
-    ///
-    /// @param target current target.
-    /// @param image selected catalog image.
-    /// @param localImage selected local image.
-    /// @return compatible target, or null when target type no longer matches.
-    static @Nullable FlashTarget compatibleTarget(
-            @Nullable FlashTarget target,
-            @Nullable ImageEntry image,
-            @Nullable Path localImage) {
-        if (target == null) {
-            return null;
-        }
-        if (localImage != null) {
-            return target.blockDevice() == null ? null : target;
-        }
-        if (image != null && ProvisionStrategies.isFastboot(image.strategy())) {
-            return target.isFastbootDevice() ? target : null;
-        }
-        if (requiresPartitionTargets(image)) {
-            return partitionTargetKeysMatch(image, target) ? target : null;
-        }
-        return target.blockDevice() == null ? null : target;
-    }
-
     /// Returns whether the current GUI writer can flash a catalog image.
     ///
     /// @param image image entry.
