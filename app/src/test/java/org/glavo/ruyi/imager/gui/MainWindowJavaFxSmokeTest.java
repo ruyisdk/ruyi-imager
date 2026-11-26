@@ -738,6 +738,45 @@ public final class MainWindowJavaFxSmokeTest {
         });
     }
 
+    /// Clearing all filters preserves a visible choice and never creates one from empty results.
+    @Test
+    public void resetsCatalogFiltersWithoutSelectingAnImage() throws Exception {
+        runOnJavaFxThread(() -> {
+            var images = manyImages();
+            var selected = images.getFirst();
+            var tree = MainWindow.<MainWindow.OperatingSystemTreeNode>selectionTreeView();
+            var changes = new ArrayList<@Nullable ImageEntry>();
+            Node browser = MainWindow.operatingSystemSelectionContent("Catalog", tree, images, selected, changes::add);
+            Button reset = (Button) browser.lookup("#catalog-reset-filters");
+            TextField search = (TextField) browser.lookup(".selection-search");
+            CheckBox flashable = (CheckBox) browser.lookup(".catalog-flashable-filter");
+            var menus = List.of("image-board-filter", "image-variant-filter", "image-supplier-filter").stream()
+                    .map(id -> (MFXComboBox<?>) browser.lookup("#" + id)).toList();
+            assertTrue(reset.isDisabled());
+            search.setText(selected.displayName());
+            menus.forEach(menu -> menu.selectIndex(1));
+            flashable.setSelected(true);
+            assertFalse(reset.isDisabled());
+            reset.fire();
+            assertTrue(reset.isDisabled());
+            assertTrue(search.getText().isEmpty());
+            assertFalse(flashable.isSelected());
+            menus.forEach(menu -> assertEquals(new MainWindow.FilterChoice(null), menu.getSelectedItem()));
+            assertSame(selected, MainWindow.selectedTreeImage(tree));
+            assertTrue(changes.isEmpty());
+
+            search.setText("no-such-image");
+            assertFalse(reset.isDisabled());
+            reset.fire();
+            assertNull(MainWindow.selectedTreeImage(tree));
+            assertEquals(1, changes.size());
+            assertNull(changes.getFirst());
+            assertEquals(images.size(), tree.getRoot().getChildren().stream()
+                    .mapToInt(category -> category.getChildren().size()).sum());
+            return null;
+        });
+    }
+
     /// Rebuilding a filtered tree cannot activate a neighboring image or clear a still-visible selection.
     @Test
     public void catalogFilterReportsOnlyEffectiveSelectionChanges() throws Exception {

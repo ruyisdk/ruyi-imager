@@ -1066,6 +1066,14 @@ public final class MainWindow {
         flashableOnly.textProperty().bind(Messages.binding("gui.image.flashableOnly"));
         FlowPane filters = new FlowPane(8, 6, boardFilter, variantFilter, supplierFilter, flashableOnly);
         filters.setAlignment(Pos.CENTER_LEFT);
+        filters.setMinWidth(0);
+        HBox.setHgrow(filters, Priority.ALWAYS);
+        Button reset = localizedButton("gui.catalog.resetFilters");
+        reset.setId("catalog-reset-filters");
+        reset.getStyleClass().add("header-button");
+        reset.setMinWidth(Region.USE_PREF_SIZE);
+        HBox filterRow = new HBox(12, filters, reset);
+        filterRow.setAlignment(Pos.CENTER_LEFT);
 
         BooleanProperty treeEmpty = new SimpleBooleanProperty();
         BooleanProperty rebuilding = new SimpleBooleanProperty();
@@ -1077,6 +1085,8 @@ public final class MainWindow {
             @Nullable String board = filterValue(boardFilter);
             @Nullable String supplier = filterValue(supplierFilter);
             @Nullable String variant = filterValue(variantFilter);
+            reset.setDisable(searchField.getText().isEmpty() && board == null && variant == null
+                    && supplier == null && !flashableOnly.isSelected());
             var boards = new TreeSet<String>();
             var variants = new TreeSet<String>();
             var suppliers = new TreeSet<String>();
@@ -1133,6 +1143,20 @@ public final class MainWindow {
         supplierFilter.getSelectionModel().selection().addListener(changed);
         variantFilter.getSelectionModel().selection().addListener(changed);
         flashableOnly.selectedProperty().addListener(changed);
+        reset.setOnAction(_ -> {
+            @Nullable ImageEntry selected = selectedTreeImage(treeView);
+            rebuilding.set(true);
+            try {
+                searchField.clear();
+                boardFilter.selectFirst();
+                variantFilter.selectFirst();
+                supplierFilter.selectFirst();
+                flashableOnly.setSelected(false);
+            } finally {
+                rebuilding.set(false);
+            }
+            refreshTree.accept(selected);
+        });
         refreshTree.accept(currentImage);
         treeView.getSelectionModel().selectedItemProperty().addListener((_, before, after) -> {
             if (!rebuilding.get() && (before != null && before.getValue().image() != null
@@ -1145,7 +1169,7 @@ public final class MainWindow {
         HBox heading = selectionHeaderRow(header, searchField);
         heading.setMinWidth(0);
         heading.setMaxWidth(Double.MAX_VALUE);
-        VBox content = new VBox(8, heading, filters, treeArea);
+        VBox content = new VBox(8, heading, filterRow, treeArea);
         VBox.setVgrow(treeArea, Priority.ALWAYS);
         return content;
     }
