@@ -9,7 +9,7 @@ import org.jetbrains.annotations.Nullable;
 /// A manufacturer, board, and variant associated with an image.
 ///
 /// @param manufacturer device or image manufacturer name.
-/// @param board target board name.
+/// @param board device ID, a `cpu:` entity reference when only a processor is known, or empty when unassociated.
 /// @param variant board or image variant name.
 @NotNullByDefault
 public record ImageTarget(String manufacturer, String board, String variant) {

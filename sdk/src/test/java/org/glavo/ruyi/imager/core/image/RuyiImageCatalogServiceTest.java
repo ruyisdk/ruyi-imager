@@ -343,7 +343,7 @@ public final class RuyiImageCatalogServiceTest {
         Files.createDirectories(configDirectory);
         writeConfig(configDirectory, repoDirectory);
         writeRepositoryConfig(repoDirectory);
-        writeDeviceEntity(repoDirectory, "sipeed-lpi4a");
+        writeDeviceEntity(repoDirectory, "sipeed-lpi4a", "sipeed-lpi4a@8g");
 
         Path systemPackage = repoDirectory.resolve("packages").resolve("board-image").resolve("revyos-sipeed-lpi4a");
         Files.createDirectories(systemPackage);
@@ -680,10 +680,10 @@ public final class RuyiImageCatalogServiceTest {
         Path repo = directory.resolve("repo");
         writeConfig(config, repo);
         writeRepositoryConfig(repo);
-        writeDeviceEntity(repo, "awol-d1dev");
-        writeDeviceEntity(repo, "sipeed-licheerv");
+        writeDeviceEntity(repo, "awol-d1dev", "allwinner-d1@generic");
+        writeDeviceEntity(repo, "sipeed-licheerv", "allwinner-d1@generic", "sipeed-licheerv@alternate");
         List<String> related = new ArrayList<>(List.of(
-                "device-variant:awol-d1dev@generic", "device-variant:sipeed-licheerv@generic",
+                "device-variant:allwinner-d1@generic",
                 "device:sipeed-licheerv", "device-variant:sipeed-licheerv@alternate",
                 "device-variant:sipeed-licheerv@generic", "cpu:allwinner-d1",
                 "device-variant:invalid@", "device:"));
@@ -705,6 +705,8 @@ public final class RuyiImageCatalogServiceTest {
         RuyiImageCatalogService service = new RuyiImageCatalogService(directories, new RuyiRepositoryStore(directories));
         ImageCatalog catalog = service.listImages();
         assertEquals(4, catalog.images().size());
+        assertEquals(2, catalog.browsableImages().size());
+        assertTrue(catalog.browsableImages().stream().allMatch(image -> image.category().equals("image-combo")));
         for (String edition : List.of("base", "xfce")) {
             String atom = "image-combo/oerv-awol-d1-" + edition;
             @Nullable ImageEntry combo = service.findImage(atom);
@@ -729,7 +731,7 @@ public final class RuyiImageCatalogServiceTest {
     /// @param directory isolated test directory.
     /// @throws Exception when fixture metadata cannot be written or parsed.
     @ParameterizedTest
-    @ValueSource(strings = {"", "related = []", "related = ['cpu:allwinner-d1', 'device-variant:invalid@', 'device:']"})
+    @ValueSource(strings = {"", "related = []", "related = ['device-variant:invalid@', 'device:']"})
     public void fallsBackWhenComboHasNoTargets(String relation, @TempDir Path directory) throws Exception {
         Path config = Files.createDirectories(directory.resolve("config"));
         Path repo = directory.resolve("repo");
@@ -746,6 +748,35 @@ public final class RuyiImageCatalogServiceTest {
         @Nullable ImageEntry combo = service.findImage("image-combo/meles");
         assertNotNull(combo);
         assertEquals(List.of(new ImageTarget("Milk-V", "milkv-meles", "generic")), combo.targets());
+    }
+
+    /// Keeps unassociated packages and processor-only combos reachable without inventing a board.
+    @Test
+    public void browsesProcessorAndUnassociatedImages(@TempDir Path directory) throws Exception {
+        Path config = Files.createDirectories(directory.resolve("config"));
+        Path repo = directory.resolve("repo");
+        writeConfig(config, repo);
+        writeRepositoryConfig(repo);
+        for (String version : List.of("1.0.0", "2.0.0")) {
+            writeImageManifest(repo, "redleaf", version, "RedleafOS", "redleaf", "redleaf.img", "dd-v1", "PLCT");
+        }
+        Path variants = Files.createDirectories(repo.resolve("entities/device-variant"));
+        Files.writeString(variants.resolve("prototype@generic.toml"), "related = ['cpu:nanhu']");
+        Path combos = Files.createDirectories(repo.resolve("entities/image-combo"));
+        Files.writeString(combos.resolve("redleaf.toml"), """
+                related = ['device-variant:prototype@generic']
+                [image-combo]
+                package_atoms = ['board-image/redleaf']
+                """);
+        AppDirectories directories = new AppDirectories(config, directory.resolve("cache"));
+        var service = new RuyiImageCatalogService(directories, new RuyiRepositoryStore(directories));
+        var visible = service.listImages().browsableImages();
+        assertEquals(2, visible.size());
+        assertTrue(visible.stream().anyMatch(image -> image.category().equals("image-combo")
+                && image.targets().getFirst().board().equals("cpu:nanhu")));
+        assertTrue(visible.stream().anyMatch(image -> image.atom().equals("board-image/redleaf(1.0.0)")
+                && image.targets().getFirst().board().isEmpty()));
+        assertNotNull(service.findImage("board-image/redleaf(2.0.0)"));
     }
 
     /// Writes the application config fixture.
@@ -795,19 +826,22 @@ public final class RuyiImageCatalogServiceTest {
     ///
     /// @param repoDirectory repository directory.
     /// @param deviceId device id.
+    /// @param variants full variant identifiers claimed by this device.
     /// @throws Exception when fixture files cannot be written.
-    private static void writeDeviceEntity(Path repoDirectory, String deviceId) throws Exception {
+    private static void writeDeviceEntity(Path repoDirectory, String deviceId, String... variants) throws Exception {
         Path deviceDirectory = repoDirectory.resolve("entities").resolve("device");
         Files.createDirectories(deviceDirectory);
         Files.writeString(
                 deviceDirectory.resolve(deviceId + ".toml"),
                 """
                         ruyi-entity = "v0"
+                        related = [%s]
 
                         [device]
                         id = "%s"
                         display_name = "%s"
-                        """.formatted(deviceId, deviceId));
+                        """.formatted(java.util.Arrays.stream(variants).map(id -> "'device-variant:" + id + "'")
+                                .collect(java.util.stream.Collectors.joining(", ")), deviceId, deviceId));
     }
 
     /// Writes a fetch-restricted image manifest fixture.

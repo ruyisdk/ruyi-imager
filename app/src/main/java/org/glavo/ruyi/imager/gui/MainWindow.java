@@ -1605,7 +1605,7 @@ public final class MainWindow {
     ///
     /// @param catalog image catalog.
     private void showBoardDialog(ImageCatalog catalog) {
-        @Unmodifiable List<BoardOption> boards = boardOptions(catalog.images());
+        @Unmodifiable List<BoardOption> boards = boardOptions(catalog.browsableImages());
         if (boards.isEmpty()) {
             showInfo(
                     Messages.get("gui.dialog.noBoards"),
@@ -1624,7 +1624,7 @@ public final class MainWindow {
             @Override
             protected void updateItem(@Nullable BoardOption item, boolean empty) {
                 super.updateItem(item, empty);
-                setText(empty || item == null ? null : Messages.get("gui.list.board", item.name(), item.imageCount(),
+                setText(empty || item == null ? null : Messages.get("gui.list.board", boardDisplayName(item.name()), item.imageCount(),
                         String.join(", ", item.suppliers().stream().map(ManufacturerNames::displayName).toList())));
             }
         });
@@ -1684,7 +1684,7 @@ public final class MainWindow {
     ///
     /// @param catalog image catalog.
     private void showOperatingSystemDialog(ImageCatalog catalog) {
-        @Unmodifiable List<ImageEntry> images = filteredImages(catalog.images(), null, state.boardName());
+        @Unmodifiable List<ImageEntry> images = filteredImages(catalog.browsableImages(), null, state.boardName());
         if (images.isEmpty()) {
             showInfo(Messages.get("gui.dialog.noOperatingSystems"), imageEmptyMessage());
             return;
@@ -1692,7 +1692,7 @@ public final class MainWindow {
 
         TreeView<OperatingSystemTreeNode> treeView = selectionTreeView();
         @Unmodifiable Map<String, ImageCacheStatus> cacheStatuses = imageCacheStatuses(images);
-        String header = Messages.get("gui.dialog.chooseOperatingSystem.header", state.boardName());
+        String header = Messages.get("gui.dialog.chooseOperatingSystem.header", boardLabel());
         Node content = operatingSystemSelectionContent(header, treeView, images, state.image(), state.boardName());
         treeView.setCellFactory(_ -> new TreeCell<>() {
             /// Updates one operating system tree cell.
@@ -1809,7 +1809,7 @@ public final class MainWindow {
                 } else {
                     ImageEntry image = match.image();
                     setText(Messages.get("gui.local.candidate", image.displayName(), image.version(), image.atom(),
-                            image.targets().stream().map(ImageTarget::board).distinct().collect(java.util.stream.Collectors.joining(", ")),
+                            image.targets().stream().map(target -> boardDisplayName(target.board())).distinct().collect(java.util.stream.Collectors.joining(", ")),
                             image.strategy(), image.components().size(),
                             catalogImageFlashable(image) ? "" : Messages.get("gui.image.support.writerUnsupported")));
                     setWrapText(true);
@@ -1826,13 +1826,13 @@ public final class MainWindow {
         }
         ListView<ImageTarget> targets = selectionListView();
         Node boards = searchableSelectionContent(Messages.get("gui.dialog.chooseBoard"), targets, image.targets(),
-                (target, query) -> (target.board() + " " + target.variant()).toLowerCase(Locale.ROOT).contains(query));
+                (target, query) -> (boardDisplayName(target.board()) + " " + target.variant()).toLowerCase(Locale.ROOT).contains(query));
         targets.setCellFactory(_ -> new MFXLegacyListCell<>() {
             /// Displays the board and variant without guessing a physical target device.
             @Override
             protected void updateItem(@Nullable ImageTarget target, boolean empty) {
                 super.updateItem(target, empty);
-                setText(empty || target == null ? null : target.board() + " / " + target.variant());
+                setText(empty || target == null ? null : boardDisplayName(target.board()) + " / " + target.variant());
             }
         });
         ImageTarget target;
@@ -3163,7 +3163,15 @@ public final class MainWindow {
         if (state.localImage() != null) {
             return Messages.get("gui.value.skippedLocal");
         }
-        return state.boardName() == null ? Messages.get("gui.value.board.none") : state.boardName();
+        return state.boardName() == null ? Messages.get("gui.value.board.none") : boardDisplayName(state.boardName());
+    }
+
+    /// Labels catalog groups without implying that an unspecified board is compatible with every image.
+    private static String boardDisplayName(String board) {
+        if (board.isEmpty()) {
+            return Messages.get("gui.value.board.unspecified");
+        }
+        return board.startsWith("cpu:") ? Messages.get("gui.value.board.processor", board.substring(4)) : board;
     }
 
     /// Formats the operating system catalog step label.
@@ -3231,7 +3239,8 @@ public final class MainWindow {
             boards.add(new BoardOption(entry.getKey(), entry.getValue(),
                     suppliers.get(entry.getKey()).stream().sorted().toList()));
         }
-        boards.sort(Comparator.comparing(BoardOption::name));
+        boards.sort(Comparator.comparing((BoardOption board) -> board.name().isEmpty())
+                .thenComparing(BoardOption::name));
         return List.copyOf(boards);
     }
 
@@ -3479,7 +3488,7 @@ public final class MainWindow {
     /// @param query normalized query.
     /// @return whether the option matches.
     private static boolean boardMatches(BoardOption board, String query) {
-        return textMatches(board.name(), query)
+        return textMatches(boardDisplayName(board.name()), query)
                 || board.suppliers().stream().anyMatch(supplier -> textMatches(supplier, query)
                         || textMatches(ManufacturerNames.displayName(supplier), query));
     }
@@ -3494,7 +3503,7 @@ public final class MainWindow {
                 || textMatches(operatingSystemCategoryName(image), query)
                 || image.targets().stream().filter(matchesTarget).anyMatch(target -> textMatches(target.manufacturer(), query)
                         || textMatches(ManufacturerNames.displayName(target.manufacturer()), query)
-                        || textMatches(target.board(), query)
+                        || textMatches(boardDisplayName(target.board()), query)
                         || textMatches(target.variant(), query))
                 || textMatches(image.strategy(), query)
                 || textMatches(image.atom(), query)
@@ -3959,7 +3968,7 @@ public final class MainWindow {
         if (boardName == null) {
             return Messages.get("gui.image.empty");
         }
-        return Messages.get("gui.image.emptyForBoard", boardName);
+        return Messages.get("gui.image.emptyForBoard", boardDisplayName(boardName));
     }
 
     /// Shows an informational dialog.

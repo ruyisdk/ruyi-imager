@@ -555,9 +555,17 @@ public final class CliApplicationTest {
     public void listsAllSharedImageTargetsAsJson(@TempDir Path directory) throws Exception {
         RuyiFixture fixture = createRuyiFixture(directory, "oerv-awol-d1-base", "openEuler D1", "oerv-d1",
                 "image.raw", "dd-v1", new byte[]{1}, new FixedBlockDeviceService(List.of()));
+        Path devices = Files.createDirectories(directory.resolve("repo/entities/device"));
+        for (String board : List.of("awol-d1dev", "sipeed-licheerv")) {
+            Files.writeString(devices.resolve(board + ".toml"), """
+                    related = ["device-variant:allwinner-d1@generic"]
+                    [device]
+                    id = "%s"
+                    """.formatted(board));
+        }
         Path combos = Files.createDirectories(directory.resolve("repo/entities/image-combo"));
         Files.writeString(combos.resolve("oerv-awol-d1-base.toml"), """
-                related = ["device-variant:awol-d1dev@generic", "device-variant:sipeed-licheerv@generic"]
+                related = ["device-variant:allwinner-d1@generic"]
                 [image-combo]
                 display_name = "openEuler D1"
                 package_atoms = ["board-image/oerv-awol-d1-base"]

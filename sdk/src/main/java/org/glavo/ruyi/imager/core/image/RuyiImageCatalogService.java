@@ -467,7 +467,9 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
             return List.of();
         }
 
-        @Unmodifiable List<String> deviceIds = readDeviceIds(metadata.root());
+        Map<String, List<String>> variantTargets = new LinkedHashMap<>();
+        @Unmodifiable List<String> deviceIds = readDeviceIds(metadata.root(), variantTargets);
+        readProcessorTargets(metadata.root(), variantTargets);
         @Unmodifiable Map<String, @Unmodifiable Map<String, String>> repoMessages =
                 readRepoMessages(metadata.root().resolve("messages.toml"));
         LOGGER.atInfo().log(() -> "Reading repository images. repo="
@@ -483,7 +485,7 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
             }
         }
         @Unmodifiable List<ImageEntry> packageImages = List.copyOf(result);
-        readImageCombos(metadata, deviceIds, packageImages, result);
+        readImageCombos(metadata, variantTargets, packageImages, result);
         LOGGER.atInfo().log(() -> "Repository image manifests read. repo=" + metadata.id() + ", images=" + result.size());
         return List.copyOf(result);
     }
@@ -505,9 +507,10 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
     /// Reads known Ruyi device ids from repository entity metadata.
     ///
     /// @param repositoryRoot repository root.
+    /// @param variantTargets receives the boards declaring each exact variant reference.
     /// @return immutable device ids sorted by longest match first.
     /// @throws IOException when device metadata cannot be read.
-    private static @Unmodifiable List<String> readDeviceIds(Path repositoryRoot) throws IOException {
+    private static @Unmodifiable List<String> readDeviceIds(Path repositoryRoot, Map<String, List<String>> variantTargets) throws IOException {
         Path deviceRoot = repositoryRoot.resolve("entities").resolve("device");
         if (!Files.isDirectory(deviceRoot)) {
             return List.of();
@@ -517,8 +520,17 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
         ArrayList<String> result = new ArrayList<>();
         try (var files = Files.newDirectoryStream(deviceRoot, "*.toml")) {
             for (Path file : files) {
-                @Nullable String id = readDeviceId(file);
-                if (id != null && seen.add(id)) {
+                TomlTable entity = parseToml(file);
+                @Nullable String id = entity.getString("device.id");
+                if (id == null || id.isBlank()) {
+                    continue;
+                }
+                for (String ref : readStringArray(entity.getArray("related"))) {
+                    if (ref.startsWith("device-variant:")) {
+                        variantTargets.computeIfAbsent(ref, _ -> new ArrayList<>()).add(id);
+                    }
+                }
+                if (seen.add(id)) {
                     result.add(id);
                 }
             }
@@ -530,20 +542,20 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
         return List.copyOf(result);
     }
 
-    /// Reads one device id from an entity file.
-    ///
-    /// @param path entity file path.
-    /// @return device id, or null when absent.
-    /// @throws IOException when the entity file cannot be parsed.
-    private static @Nullable String readDeviceId(Path path) throws IOException {
-        TomlParseResult entity = parseToml(path);
-        @Nullable TomlTable device = entity.getTable("device");
-        if (device == null) {
-            return null;
+    /// Indexes processor references only for variants not claimed by any board.
+    private static void readProcessorTargets(Path root, Map<String, List<String>> variantTargets) throws IOException {
+        Path variants = root.resolve("entities/device-variant");
+        if (Files.isDirectory(variants)) {
+            try (var files = Files.newDirectoryStream(variants, "*.toml")) {
+                for (Path file : files) {
+                    String ref = "device-variant:" + comboName(file);
+                    if (!variantTargets.containsKey(ref)) {
+                        variantTargets.put(ref, readStringArray(parseToml(file).getArray("related")).stream()
+                                .filter(RuyiImageCatalogService::isProcessorReference).toList());
+                    }
+                }
+            }
         }
-
-        @Nullable String id = device.getString("id");
-        return id == null || id.isBlank() ? null : id;
     }
 
     /// Counts hyphen-separated fragments in an id.
@@ -619,13 +631,13 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
     /// Reads image-combo entities and appends resolved combo entries.
     ///
     /// @param metadata repository metadata.
-    /// @param deviceIds known device ids.
+    /// @param variantTargets boards or processors associated with each variant.
     /// @param packageImages package image entries available for combo resolution.
     /// @param result mutable output list.
     /// @throws IOException when combo entities cannot be read.
     private static void readImageCombos(
             RuyiRepositoryMetadata metadata,
-            @Unmodifiable List<String> deviceIds,
+            Map<String, List<String>> variantTargets,
             @Unmodifiable List<ImageEntry> packageImages,
             ArrayList<ImageEntry> result) throws IOException {
         Path comboRoot = metadata.root().resolve("entities").resolve("image-combo");
@@ -636,7 +648,7 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
         int beforeCount = result.size();
         try (var files = Files.newDirectoryStream(comboRoot, "*.toml")) {
             for (Path comboPath : files) {
-                @Nullable ImageEntry combo = readImageCombo(metadata, comboPath, deviceIds, packageImages);
+                @Nullable ImageEntry combo = readImageCombo(metadata, comboPath, variantTargets, packageImages);
                 if (combo != null) {
                     result.add(combo);
                 }
@@ -650,14 +662,14 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
     ///
     /// @param metadata repository metadata.
     /// @param comboPath combo entity path.
-    /// @param deviceIds known device ids.
+    /// @param variantTargets boards or processors associated with each variant.
     /// @param packageImages package image entries available for combo resolution.
     /// @return combo image entry, or null when incomplete.
     /// @throws IOException when the combo entity cannot be parsed.
     private static @Nullable ImageEntry readImageCombo(
             RuyiRepositoryMetadata metadata,
             Path comboPath,
-            @Unmodifiable List<String> deviceIds,
+            Map<String, List<String>> variantTargets,
             @Unmodifiable List<ImageEntry> packageImages) throws IOException {
         TomlParseResult entity = parseToml(comboPath);
         @Nullable TomlTable combo = entity.getTable("image-combo");
@@ -720,17 +732,13 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
         String version = firstPackage.version();
         @Nullable String displayName = combo.getString("display_name");
         List<ImageTarget> targets = new ArrayList<>();
-        for (DeviceNameParts relatedDevice : readRelatedDeviceNames(entity)) {
+        for (DeviceNameParts relatedDevice : readRelatedDeviceNames(entity, variantTargets)) {
             String manufacturer = DEVICE_MANUFACTURERS.getOrDefault(
                     firstFragment(relatedDevice.deviceId()), firstPackage.targets().getFirst().manufacturer());
             targets.add(new ImageTarget(manufacturer, relatedDevice.deviceId(), relatedDevice.variant()));
         }
         if (targets.isEmpty()) {
-            @Nullable DeviceNameParts parsedDevice = parseDeviceName("board-image", firstPackage.name(), deviceIds);
-            ImageTarget fallback = firstPackage.targets().getFirst();
-            targets.add(parsedDevice == null ? fallback : new ImageTarget(
-                    DEVICE_MANUFACTURERS.getOrDefault(firstFragment(parsedDevice.deviceId()), fallback.manufacturer()),
-                    parsedDevice.deviceId(), parsedDevice.variant()));
+            targets.addAll(firstPackage.targets());
         }
 
         String strategy = components.getFirst().strategy();
@@ -805,8 +813,9 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
     /// Reads all valid direct device and device-variant associations from a combo entity.
     ///
     /// @param entity combo entity.
+    /// @param variantTargets boards or processors associated with each variant.
     /// @return immutable device associations in encounter order.
-    private static @Unmodifiable List<DeviceNameParts> readRelatedDeviceNames(TomlTable entity) {
+    private static @Unmodifiable List<DeviceNameParts> readRelatedDeviceNames(TomlTable entity, Map<String, List<String>> variantTargets) {
         @Nullable TomlArray related = entity.getArray("related");
         if (related == null) {
             return List.of();
@@ -823,9 +832,9 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
                 String deviceVariant = text.substring("device-variant:".length());
                 int separator = deviceVariant.indexOf('@');
                 if (separator > 0 && separator < deviceVariant.length() - 1) {
-                    devices.add(new DeviceNameParts(
-                            deviceVariant.substring(0, separator),
-                            deviceVariant.substring(separator + 1)));
+                    for (String target : variantTargets.getOrDefault(text, List.of()).stream().distinct().sorted().toList()) {
+                        devices.add(new DeviceNameParts(target, deviceVariant.substring(separator + 1)));
+                    }
                 }
             } else if (text.startsWith("device:")) {
                 String device = text.substring("device:".length());
@@ -834,7 +843,19 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
                 }
             }
         }
+        if (devices.isEmpty()) {
+            for (String ref : readStringArray(related)) {
+                if (isProcessorReference(ref)) {
+                    devices.add(new DeviceNameParts(ref, "generic"));
+                }
+            }
+        }
         return List.copyOf(devices);
+    }
+
+    /// Returns whether an entity reference names a processor.
+    private static boolean isProcessorReference(String reference) {
+        return reference.startsWith("cpu:") && !reference.substring(4).isBlank();
     }
 
     /// Reads one provisionable image manifest.
@@ -877,7 +898,8 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
         @Nullable String slug = readSlug(manifest);
         String displayName = readDisplayName(manifest, category, name, version);
         @Nullable DeviceNameParts deviceName = parseDeviceName(category, name, deviceIds);
-        String boardName = deriveBoardName(category, name, deviceName);
+        String boardName = deviceName != null ? deviceName.deviceId()
+                : deviceIds.isEmpty() ? legacyBoardName(category, name) : "";
         String manufacturer = deriveManufacturer(category, name, manifest, metadata.id(), deviceName);
         String atom = category + "/" + name + "(" + version + ")";
         return new ImageEntry(
@@ -1179,26 +1201,21 @@ public final class RuyiImageCatalogService implements ImageCatalogService {
         return legacySlug == null || legacySlug.isBlank() ? null : legacySlug;
     }
 
-    /// Derives a board label from Ruyi image naming conventions.
+    /// Recognizes vendor-prefixed board names in repositories without device entities.
     ///
     /// @param category package category.
     /// @param name package name.
-    /// @param deviceName parsed device name from entity metadata.
-    /// @return board label.
-    private static String deriveBoardName(String category, String name, @Nullable DeviceNameParts deviceName) {
+    /// @return board label, or empty when unrecognized.
+    private static String legacyBoardName(String category, String name) {
         if (!"board-image".equals(category)) {
-            return name;
+            return "";
         }
-        if (deviceName != null) {
-            return deviceName.deviceId();
-        }
-
         String[] fragments = name.split("-");
         int vendorIndex = deviceVendorIndex(fragments);
         if (vendorIndex >= 0) {
             return joinFragments(fragments, vendorIndex, deviceEndIndex(fragments, vendorIndex));
         }
-        return name;
+        return "";
     }
 
     /// Derives a variant label from Ruyi image naming conventions.
