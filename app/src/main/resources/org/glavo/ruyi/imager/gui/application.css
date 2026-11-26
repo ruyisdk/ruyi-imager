@@ -45,8 +45,12 @@
 .root,
 .mfx-button,
 .mfx-text-field,
-.mfx-combo-box-cell .data-label {
+.mfx-combo-box-cell .label {
     -fx-font-family: "Alibaba PuHuiTi 3.0 65 Medium";
+}
+
+.mfx-combo-box-cell .label {
+    -fx-text-fill: #18212b;
 }
 
 /* Combo boxes do not use floating labels; INLINE places their editor at the bottom. */

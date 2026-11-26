@@ -848,6 +848,45 @@ public final class MainWindowJavaFxSmokeTest {
         });
     }
 
+    /// Checks the actual popup labels, not the editor that displays the current selection.
+    @Test
+    public void showsReadableComboPopupOptions(@TempDir Path directory) throws Exception {
+        runOnJavaFxThread(() -> {
+            Platform.setImplicitExit(false);
+            MainWindow window = new MainWindow(testServices(directory));
+            window.showHomeCatalog(new MainWindow.CatalogLoadResult(manyImages(), Map.of()));
+            Stage owner = new Stage();
+            try {
+                var scene = new Scene(window.root(), 840, 560);
+                scene.getStylesheets().add(applicationStylesheet());
+                owner.setScene(scene);
+                owner.show();
+                var selector = (MFXComboBox<?>) scene.lookup("#image-board-filter");
+                selector.show();
+                var popup = javafx.stage.Window.getWindows().stream()
+                        .filter(w -> w instanceof javafx.stage.PopupWindow p && p.getOwnerWindow() == owner)
+                        .findFirst().orElseThrow();
+                Parent content = popup.getScene().getRoot();
+                content.applyCss();
+                content.layout();
+                Set<String> options = new java.util.HashSet<>();
+                for (Node cell : content.lookupAll(".mfx-combo-box-cell")) {
+                    Label label = assertInstanceOf(Label.class, cell.lookup(".label"));
+                    options.add(label.getText());
+                    assertTrue(((Color) label.getTextFill()).getBrightness() < 0.6, label.getText());
+                    cell.pseudoClassStateChanged(PseudoClass.getPseudoClass("hover"), true);
+                    content.applyCss();
+                    assertTrue(((Color) label.getTextFill()).getBrightness() < 0.6, label.getText());
+                }
+                assertEquals(Set.of(Messages.get("gui.image.allHardware"), "test-board"), options);
+            } finally {
+                owner.hide();
+                window.shutdown();
+            }
+            return null;
+        });
+    }
+
     /// Verifies that MaterialFX selectors center their editor when no floating label is used.
     ///
     /// @throws Exception when JavaFX execution fails.
