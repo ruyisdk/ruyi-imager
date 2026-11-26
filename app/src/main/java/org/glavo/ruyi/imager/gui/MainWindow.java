@@ -558,7 +558,7 @@ public final class MainWindow {
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
-        HBox titleRow = new HBox(16, createHeaderLogo(), title, spacer, localImageButton, settingsButton);
+        HBox titleRow = new HBox(16, createHeaderLogo(), title, spacer, settingsButton);
         titleRow.setAlignment(Pos.CENTER_LEFT);
         titleRow.getStyleClass().add("app-header");
         return titleRow;
@@ -672,6 +672,7 @@ public final class MainWindow {
         cancelFlashButton.getStyleClass().add("cancel-flash-button");
         storageButton.getStyleClass().add("step-button");
         downloadOsButton.getStyleClass().add("header-button");
+        downloadOsButton.managedProperty().bind(downloadOsButton.visibleProperty());
 
         phaseProgressBox.getStyleClass().add("phase-progress-box");
         phaseProgressBox.setVisible(false);
@@ -685,9 +686,11 @@ public final class MainWindow {
         showCatalogNotice(Messages.get("gui.progress.loadingCatalog"), false);
 
         VBox source = summaryField(localizedLabel("gui.step.os"), osValue);
+        source.getChildren().add(new HBox(8, localImageButton, downloadOsButton));
         VBox target = summaryField(targetTitle, storageValue);
-        HBox actions = new HBox(12, source, downloadOsButton, target, storageButton, flashButton);
-        actions.setAlignment(Pos.CENTER_LEFT);
+        target.getChildren().add(storageButton);
+        HBox actions = new HBox(24, source, target, flashButton);
+        actions.setAlignment(Pos.BOTTOM_LEFT);
         actions.getStyleClass().add("selection-summary");
         selectionControlsBox.getChildren().setAll(catalogSurface, actions);
         VBox.setVgrow(selectionControlsBox, Priority.ALWAYS);
@@ -1640,7 +1643,7 @@ public final class MainWindow {
         String header = Messages.get("gui.dialog.chooseOperatingSystem.header");
         catalogTree = treeView;
         Node content = operatingSystemSelectionContent(header, treeView, images,
-                state.image() != null && images.contains(state.image()) ? state.image() : null,
+                state.image() != null && !state.imported() && images.contains(state.image()) ? state.image() : null,
                 selected -> {
                     if (selected != null) {
                         selectCatalogImage(selected);
@@ -1818,7 +1821,7 @@ public final class MainWindow {
         if (catalogTree != null) {
             catalogTree.getSelectionModel().clearSelection();
         }
-        state = new WizardState(image, null, null);
+        state = new WizardState(image, null, null, true);
         refreshCatalogCacheStatus(image);
         refreshState();
     }
@@ -1941,10 +1944,7 @@ public final class MainWindow {
         if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseFastbootDevice"), content, listView, selectionCanConfirm(listView))) {
             FastbootDevice selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
-                state = new WizardState(
-                        state.image(),
-                        state.localImage(),
-                        FlashTarget.fastbootDevice(selected));
+                state = state.withTarget(FlashTarget.fastbootDevice(selected));
                 refreshState();
             }
         }
@@ -2001,10 +2001,7 @@ public final class MainWindow {
         if (showSearchableSelectionDialog(Messages.get("gui.dialog.chooseStorageDevice"), content, listView, selectionCanConfirm(listView))) {
             BlockDevice selected = listView.getSelectionModel().getSelectedItem();
             if (selected != null) {
-                state = new WizardState(
-                        state.image(),
-                        state.localImage(),
-                        FlashTarget.blockDevice(selected));
+                state = state.withTarget(FlashTarget.blockDevice(selected));
                 refreshState();
             }
         }
@@ -2091,10 +2088,7 @@ public final class MainWindow {
                 partitionSelectorsReady(selectors))) {
             @Nullable FlashTarget selectedTarget = partitionTargetSelection(selectors);
             if (selectedTarget != null) {
-                state = new WizardState(
-                        state.image(),
-                        state.localImage(),
-                        selectedTarget);
+                state = state.withTarget(selectedTarget);
                 refreshState();
             }
         }
@@ -2808,9 +2802,9 @@ public final class MainWindow {
         settingsButton.setDisable(busy.get());
         catalogSurface.setDisable(busy.get());
         @Nullable ImageEntry selectedImage = state.image();
+        downloadOsButton.setVisible(selectedImage != null && !state.imported());
         downloadOsButton.setDisable(busy.get()
-                || state.localImage() != null
-                || selectedImage == null
+                || selectedImage == null || state.imported()
                 || !canDownloadSelectedImage(selectedImage));
         localImageButton.setDisable(localImageInProgress ? localImageCancellationRequested : busy.get());
         storageButton.setDisable(busy.get() || !hasImageSource());
@@ -4270,11 +4264,22 @@ public final class MainWindow {
     /// @param image selected operating system image.
     /// @param localImage selected local image file.
     /// @param target selected target device.
+    /// @param imported whether the selected catalog entry was prepared from local files.
     @NotNullByDefault
     private record WizardState(
             @Nullable ImageEntry image,
             @Nullable Path localImage,
-            @Nullable FlashTarget target) {
+            @Nullable FlashTarget target,
+            boolean imported) {
+        /// Creates a selection without an imported catalog entry.
+        private WizardState(@Nullable ImageEntry image, @Nullable Path localImage, @Nullable FlashTarget target) {
+            this(image, localImage, target, false);
+        }
+
+        /// Replaces the destination without changing how the source was selected.
+        private WizardState withTarget(FlashTarget target) {
+            return new WizardState(image, localImage, target, imported);
+        }
     }
 
     /// Operating system category alias used for image metadata inference.

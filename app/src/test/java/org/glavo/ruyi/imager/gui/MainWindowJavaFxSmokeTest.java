@@ -184,6 +184,11 @@ public final class MainWindowJavaFxSmokeTest {
                 select.setAccessible(true);
                 select.invoke(window, image);
                 Object state = stateField.get(window);
+                var download = (Button) windowField(window, "downloadOsButton");
+                assertFalse(download.isVisible());
+                assertFalse(download.isManaged());
+                window.showHomeCatalog(new MainWindow.CatalogLoadResult(List.of(image), Map.of()));
+                assertNull(((TreeView<?>) windowField(window, "catalogTree")).getSelectionModel().getSelectedItem());
                 for (String property : List.of("localImage", "target")) {
                     var getter = stateClass.getDeclaredMethod(property);
                     getter.setAccessible(true);
@@ -1372,6 +1377,25 @@ public final class MainWindowJavaFxSmokeTest {
                 assertTrue(catalog.getLayoutBounds().getWidth() > width * 0.85);
                 assertTrue(catalog.getLayoutBounds().getHeight() > scene.getHeight() * 0.45);
                 assertAbove(actions, footer);
+                var local = (Button) windowField(window, "localImageButton");
+                var download = (Button) windowField(window, "downloadOsButton");
+                var storage = (Button) windowField(window, "storageButton");
+                assertTrue(local.isVisible());
+                assertAbove(catalog, local);
+                assertFalse(download.isManaged());
+                var tree = (TreeView<?>) windowField(window, "catalogTree");
+                tree.getSelectionModel().select(1);
+                window.root().layout();
+                assertTrue(download.isVisible());
+                assertTrue(download.isManaged());
+                assertTrue(local.localToScene(local.getLayoutBounds()).getMaxX()
+                        < download.localToScene(download.getLayoutBounds()).getMinX());
+                assertTrue(download.localToScene(download.getLayoutBounds()).getMaxX()
+                        < storage.localToScene(storage.getLayoutBounds()).getMinX());
+                assertTrue(flash.localToScene(flash.getLayoutBounds()).getMaxX() <= scene.getWidth());
+                tree.getSelectionModel().clearSelection();
+                assertFalse(download.isVisible());
+                assertFalse(download.isManaged());
                 String detail = "Writing https://example.invalid/" + "long-image-directory/".repeat(20) + "root.img";
                 status.setText(detail);
                 progress.setVisible(true);

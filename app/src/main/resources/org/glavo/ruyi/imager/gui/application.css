@@ -134,7 +134,6 @@
 }
 
 .selection-summary {
-    -fx-alignment: center-left;
     -fx-padding: 12 0 0 0;
     -fx-border-color: #d9dfe7 transparent transparent transparent;
 }
